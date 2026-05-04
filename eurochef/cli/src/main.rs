@@ -141,6 +141,17 @@ enum EdbCommand {
         #[arg(value_enum, short, long, ignore_case = true)]
         platform: Option<PlatformArg>,
     },
+    /// Patch text in an .edb file
+    PatchText {
+        /// .edb file to patch
+        filename: String,
+
+        /// CSV file with new text
+        csv_file: String,
+
+        /// Output .edb file (optional, will overwrite if not specified)
+        output_filename: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -243,6 +254,11 @@ fn handle_edb(cmd: EdbCommand) -> anyhow::Result<()> {
             platform,
             output_folder,
         } => edb::animations::execute_command(filename, platform, output_folder),
+        EdbCommand::PatchText {
+            filename,
+            csv_file,
+            output_filename,
+        } => edb::patch::execute_patch_text(filename, csv_file, output_filename),
     }
 }
 
