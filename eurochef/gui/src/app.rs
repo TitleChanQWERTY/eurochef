@@ -467,10 +467,14 @@ impl EurochefApp {
         let mut file_data = std::fs::read(filename).context("Failed to read EDB file")?;
         let mut patch_actions = vec![];
         let endian;
+        let original_size;
+        let original_base_size;
         {
             let reader = Cursor::new(file_data.clone());
             let mut edb = EdbFile::new(Box::new(reader), platform)?;
             endian = edb.endian;
+            original_size = edb.header.file_size;
+            original_base_size = edb.header.base_file_size;
 
             let header = edb.header.clone();
             // Find the SAME spreadsheet in the file that we have in memory
@@ -493,9 +497,19 @@ impl EurochefApp {
                         let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
 
                         if let Some(new_text) = translations.get(&(i, item.hashcode)) {
-                            let current_text = item.string.to_string().trim().to_string();
-                            if &current_text != new_text {
-                                patch_actions.push((item_pos + 4, new_text.clone()));
+                            let current_text = item.string.to_string();
+                            if &current_text.trim() != new_text {
+                                let addr = item.string.offset_absolute();
+                                let original_len = current_text.encode_utf16().count();
+                                let mut extra_space = 0;
+                                let mut check_pos = (addr + (original_len + 1) as u64 * 2) as usize;
+                                // Scan for trailing nulls to see if we can fit a longer string in-place
+                                while check_pos + 1 < file_data.len() && file_data[check_pos] == 0 && file_data[check_pos+1] == 0 {
+                                    extra_space += 1;
+                                    check_pos += 2;
+                                    if extra_space > 256 { break; } 
+                                }
+                                patch_actions.push((item_pos + 4, new_text.clone(), addr, original_len + extra_space));
                             }
                         }
                     }
@@ -513,26 +527,44 @@ impl EurochefApp {
             file_data.push(0);
         }
 
+        let mut string_offsets = std::collections::HashMap::new();
         let mut strings_patched = 0;
-        for (ptr_pos, new_text) in patch_actions {
-            let utf16_text: Vec<u16> = new_text
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-
-            // Align to 4 bytes for each string start
-            while file_data.len() % 4 != 0 {
-                file_data.push(0);
-            }
-
-            let string_address = file_data.len() as u64;
-
-            for &wchar in &utf16_text {
-                match endian {
-                    Endian::Little => file_data.extend_from_slice(&wchar.to_le_bytes()),
-                    Endian::Big => file_data.extend_from_slice(&wchar.to_be_bytes()),
+        for (ptr_pos, new_text, original_addr, original_space) in patch_actions {
+            let new_len = new_text.encode_utf16().count();
+            let string_address = if let Some(&addr) = string_offsets.get(&new_text) {
+                addr
+            } else if new_len <= original_space {
+                // In-place replacement
+                let mut utf16_text: Vec<u16> = new_text.encode_utf16().collect();
+                while utf16_text.len() <= original_space {
+                    utf16_text.push(0);
                 }
-            }
+                for (i, &wchar) in utf16_text.iter().enumerate() {
+                    let bytes = match endian {
+                        Endian::Little => wchar.to_le_bytes(),
+                        Endian::Big => wchar.to_be_bytes(),
+                    };
+                    let start = (original_addr + i as u64 * 2) as usize;
+                    file_data[start..start + 2].copy_from_slice(&bytes);
+                }
+                string_offsets.insert(new_text.clone(), original_addr);
+                original_addr
+            } else {
+                // Append to end
+                while file_data.len() % 16 != 0 {
+                    file_data.push(0);
+                }
+                let addr = file_data.len() as u64;
+                let utf16_text: Vec<u16> = new_text.encode_utf16().chain(std::iter::once(0)).collect();
+                for &wchar in &utf16_text {
+                    match endian {
+                        Endian::Little => file_data.extend_from_slice(&wchar.to_le_bytes()),
+                        Endian::Big => file_data.extend_from_slice(&wchar.to_be_bytes()),
+                    }
+                }
+                string_offsets.insert(new_text.clone(), addr);
+                addr
+            };
 
             let relative_offset = (string_address as i64 - ptr_pos as i64) as i32;
             let offset_bytes = match endian {
@@ -540,14 +572,13 @@ impl EurochefApp {
                 Endian::Big => relative_offset.to_be_bytes(),
             };
 
-            // Diagnostic log
-            info!(
-                "Patching string at 0x{:x} (ptr at 0x{:x}) with offset 0x{:x} ('{}')",
-                string_address, ptr_pos, relative_offset, new_text
-            );
-
             file_data[ptr_pos as usize..ptr_pos as usize + 4].copy_from_slice(&offset_bytes);
             strings_patched += 1;
+        }
+
+        // Align the whole file to 2048 bytes (sector size)
+        while file_data.len() % 2048 != 0 {
+            file_data.push(0);
         }
 
         let final_size = file_data.len() as u32;

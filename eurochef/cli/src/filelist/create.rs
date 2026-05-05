@@ -149,6 +149,7 @@ pub fn execute_command(
     pb.set_message("Packing files");
 
     let mut common_garbage_buf = vec![];
+    let mut strings_patched = 0;
 
     // Virtual path, real path
     for (i, (vpath, rpath)) in file_paths.iter().enumerate().progress_with(pb) {
@@ -160,6 +161,7 @@ pub fn execute_command(
 
         let (hashcode, version, flags) = if vpath.to_ascii_lowercase().ends_with(".edb") {
             // Use base filesize instead of full filesize
+            // (Offset 0x18 in EDB header)
             infile.seek(std::io::SeekFrom::Start(0x18))?;
             length = infile.read_type(endian)?;
 
@@ -210,13 +212,6 @@ pub fn execute_command(
         let aligned_pos = (unaligned_pos + 0x7ff) & !0x7ff; /* swy: 2048 - 1 = 0x7ff */
         let difference: usize = (aligned_pos - unaligned_pos) as usize;
 
-        // swy: this funky buffer holds the cumulative overwritten contents of everything that came before;
-        //      we need to use this as a sort of emulation layer for matching how the original XUtil memcpy()'ed not only
-        //      until the end of the current file, but also extending it to any garbage data that may lay beyond the limit, what's there?
-        //      probably the data at that offset of any previous file big enough to reach there, otherwise we'll use zeroes
-
-        //      so here we're always making the buffer big enough to cover the total space that we need, and then pasting the file to cover
-        //      from the start, until its maximum size, anything that remains keeps the previous data, because that's what we like ¯\_(ツ)_/¯
         let filedata_len_plus_padding = filedata.len() + difference;
 
         common_garbage_buf.resize(
@@ -225,16 +220,7 @@ pub fn execute_command(
         );
         common_garbage_buf[0..filedata.len()].copy_from_slice(&filedata);
 
-        println!(
-            "{} {} remaining space: {:#x} - {:#x} = {:#x}",
-            i, vpath, unaligned_pos, aligned_pos, difference
-        );
-
         if difference > 0 {
-            // swy: fill out the padding with the correct garbage at that offset,
-            //      this should make the diff engines' life easier. and we should
-            //      get a byte-by-byte perfect reconstruction for pristine files,
-            //      (as long as they get stored in the same order with the help of a handy .scr spec file)
             f_data.write_all(&common_garbage_buf[filedata.len()..filedata_len_plus_padding])?;
         }
     }
@@ -264,7 +250,7 @@ pub fn execute_command(
     f_info.seek(std::io::SeekFrom::Start(filename_data_offset))?;
 
     for (i, (v, _)) in files.iter().enumerate() {
-        let mut path_buf = v.to_lowercase().as_bytes().to_vec();
+        let mut path_buf = v.as_bytes().to_vec();
         path_buf.push(0);
 
         if version >= 7 {
