@@ -25,8 +25,43 @@ fn main() -> Result<()> {
 
     eurochef_gui::panic_dialog::setup();
 
-    // Log to stdout (if you run with `RUST_LOG=debug`).
-    tracing_subscriber::fmt::init();
+    let log_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    #[derive(Clone)]
+    struct LogBuffer(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let s = String::from_utf8_lossy(buf).into_owned();
+            if let Ok(mut logs) = self.0.lock() {
+                for line in s.lines() {
+                    logs.push(line.to_string());
+                }
+                let len = logs.len();
+                if len > 1000 {
+                    logs.drain(0..len - 1000);
+                }
+            }
+            print!("{}", s);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            use std::io::Write;
+            std::io::stdout().flush()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    tracing_subscriber::fmt()
+        .with_writer(LogBuffer(log_buffer.clone()))
+        .with_ansi(false)
+        .init();
 
     let native_options = eframe::NativeOptions {
         initial_window_size: Some([1280., 1024.].into()),
@@ -42,6 +77,7 @@ fn main() -> Result<()> {
                 args.file,
                 args.hashcodes,
                 cc,
+                log_buffer,
             ))
         }),
     );
@@ -68,7 +104,7 @@ fn main() {
             .start(
                 "the_canvas_id", // hardcode it
                 web_options,
-                Box::new(|cc| Box::new(eurochef_gui::EurochefApp::new(None, None, cc))),
+                Box::new(|cc| Box::new(eurochef_gui::EurochefApp::new(None, None, cc, std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))))),
             )
             .await
             .expect("failed to start eframe");

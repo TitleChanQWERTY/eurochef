@@ -78,6 +78,8 @@ pub struct EurochefApp {
     game: String,
     pub current_file: Option<String>,
     pub current_platform: Option<Platform>,
+    console_logs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    show_console: bool,
 }
 
 impl EurochefApp {
@@ -86,6 +88,7 @@ impl EurochefApp {
         path: Option<String>,
         hashcodes_path: Option<String>,
         cc: &CreationContext<'_>,
+        console_logs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     ) -> Self {
         // Install FontAwesome font and place it second
         let mut fonts = FontDefinitions::default();
@@ -144,6 +147,8 @@ impl EurochefApp {
             show_profiler: false,
             current_file: None,
             current_platform: None,
+            console_logs,
+            show_console: false,
         };
 
         if let Some(path) = path {
@@ -701,6 +706,20 @@ impl eframe::App for EurochefApp {
                 puffin_egui::profiler_ui(ui);
             });
 
+        if self.show_console {
+            egui::Window::new("Debug Console")
+                .open(&mut self.show_console)
+                .vscroll(true)
+                .show(ctx, |ui| {
+                    if let Ok(logs) = self.console_logs.lock() {
+                        for log in logs.iter() {
+                            ui.label(log);
+                        }
+                    }
+                    ui.scroll_to_cursor(Some(egui::Align::BOTTOM));
+                });
+        }
+
         if let Some((data, load_path)) = self.load_input.take() {
             let platform = Platform::from_path(&load_path);
             self.pending_file = Some((data, platform));
@@ -804,13 +823,16 @@ impl eframe::App for EurochefApp {
                     }
                 });
 
-                if ui.button("Profiler").clicked() {
-                    self.show_profiler = true;
-                }
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.show_profiler, "Profiler");
+                    ui.checkbox(&mut self.show_console, "Debug Console");
+                });
 
-                if ui.button("About").clicked() {
-                    self.about_window = true;
-                }
+                ui.menu_button("About", |ui| {
+                    if ui.button("About").clicked() {
+                        self.about_window = true;
+                    }
+                });
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let style: egui::Style = (*ui.ctx().style()).clone();

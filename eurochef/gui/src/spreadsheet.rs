@@ -10,6 +10,7 @@ pub struct TextItemList {
 
     pub spreadsheets: Vec<(Hashcode, UXGeoSpreadsheet)>,
     selected_section: usize,
+    filtered_indices: Option<Vec<Vec<usize>>>,
 }
 
 impl TextItemList {
@@ -19,19 +20,46 @@ impl TextItemList {
             search_text: String::new(),
             spreadsheets,
             selected_section: 0,
+            filtered_indices: None,
         }
     }
 
     // TODO: Display separate spreadsheets
     pub fn show(&mut self, ui: &mut egui::Ui) {
+        let mut update_filter = self.filtered_indices.is_none();
+
         ui.horizontal(|ui| {
             ui.label("Search: ");
-            ui.text_edit_singleline(&mut self.search_text);
+            if ui.text_edit_singleline(&mut self.search_text).changed() {
+                update_filter = true;
+            }
             ui.label("Hashcode: ");
-            egui::TextEdit::singleline(&mut self.search_hashcode)
+            if egui::TextEdit::singleline(&mut self.search_hashcode)
                 .font(FontSelection::Style(egui::TextStyle::Monospace))
                 .desired_width(76.0)
-                .show(ui);
+                .show(ui)
+                .response
+                .changed()
+            {
+                update_filter = true;
+            }
+            ui.separator();
+            if ui.button("Export CSV").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                {
+                    self.export_csv(path);
+                }
+            }
+            if ui.button("Import CSV").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .pick_file()
+                {
+                    self.import_csv(path);
+                }
+            }
         });
 
         ui.separator();
@@ -53,29 +81,36 @@ impl TextItemList {
             _ => unreachable!(),
         };
 
-        let section_hashes: Vec<u32> = sections.iter().map(|s| s.hashcode).collect();
+        if update_filter {
+            self.filtered_indices = Some(
+                sections
+                    .iter()
+                    .map(|s| {
+                        s.entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, v)| {
+                                if self.search_hashcode.is_empty() {
+                                    true
+                                } else {
+                                    format!("{:08x}", v.hashcode)
+                                        .contains(&self.search_hashcode.to_lowercase())
+                                }
+                            })
+                            .filter(|(_, v)| {
+                                v.text
+                                    .to_lowercase()
+                                    .contains(&self.search_text.to_lowercase())
+                            })
+                            .map(|(i, _)| i)
+                            .collect()
+                    })
+                    .collect(),
+            );
+        }
 
-        let mut filtered_items: Vec<Vec<&mut UXGeoTextItem>> = sections
-            .iter_mut()
-            .map(|s| {
-                s.entries
-                    .iter_mut()
-                    .filter(|v| {
-                        if self.search_hashcode.is_empty() {
-                            true
-                        } else {
-                            format!("{:08x}", v.hashcode)
-                                .contains(&self.search_hashcode.to_lowercase())
-                        }
-                    })
-                    .filter(|v| {
-                        v.text
-                            .to_lowercase()
-                            .contains(&self.search_text.to_lowercase())
-                    })
-                    .collect()
-            })
-            .collect();
+        let section_hashes: Vec<u32> = sections.iter().map(|s| s.hashcode).collect();
+        let filtered_indices = self.filtered_indices.as_ref().unwrap();
 
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
@@ -84,7 +119,7 @@ impl TextItemList {
                     .show(ui, |ui| {
                         let mut current_set = 0;
                         for (i, hashcode) in section_hashes.iter().enumerate() {
-                            if filtered_items[i].is_empty() {
+                            if filtered_indices[i].is_empty() {
                                 continue;
                             }
 
@@ -107,14 +142,16 @@ impl TextItemList {
 
             ui.vertical(|ui| {
                 let text_height = egui::TextStyle::Body.resolve(ui.style()).size * 1.25;
-                let table = egui_extras::TableBuilder::new(ui)
-                    .striped(true)
-                    .column(egui_extras::Column::exact(76.0))
-                    .column(egui_extras::Column::exact(76.0))
-                    .column(egui_extras::Column::remainder().resizable(true).clip(true));
+                
+                egui::ScrollArea::horizontal().show(ui, |ui| {
+                    let table = egui_extras::TableBuilder::new(ui)
+                        .striped(true)
+                        .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
+                        .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
+                        .column(egui_extras::Column::remainder().at_least(300.0).resizable(true).clip(true));
 
-                table
-                    .header(20., |mut header| {
+                    table
+                        .header(20., |mut header| {
                         header.col(|ui| {
                             ui.strong("Hashcode");
                         });
@@ -126,10 +163,12 @@ impl TextItemList {
                         });
                     })
                     .body(|body| {
-                        let section_items = &mut filtered_items[self.selected_section];
-                        let num_rows = section_items.len();
+                        let section_indices = &filtered_indices[self.selected_section];
+                        let section_items = &mut sections[self.selected_section].entries;
+                        let num_rows = section_indices.len();
                         body.rows(text_height, num_rows, |row_index, mut row| {
-                            let item = &mut section_items[row_index];
+                            let item_index = section_indices[row_index];
+                            let item = &mut section_items[item_index];
                             let item_hashcode = item.hashcode;
                             let item_text = item.text.clone();
                             let context_menu = move |ui: &mut egui::Ui| {
@@ -160,7 +199,9 @@ impl TextItemList {
                             .context_menu(context_menu.clone());
 
                             row.col(|ui| {
-                                if ui.add(egui::TextEdit::singleline(&mut item.text)).changed() {
+                                let text_edit = egui::TextEdit::singleline(&mut item.text)
+                                    .desired_width(f32::INFINITY);
+                                if ui.add(text_edit).changed() {
                                     // The item.text is already updated because we passed a mutable reference to TextEdit
                                 }
                             })
@@ -168,7 +209,62 @@ impl TextItemList {
                             .context_menu(context_menu);
                         })
                     });
+                });
             });
         });
+    }
+
+    fn export_csv(&self, path: std::path::PathBuf) {
+        let spreadsheet = self.spreadsheets.iter().find(|(_, v)| match v {
+            UXGeoSpreadsheet::Data(_) => false,
+            UXGeoSpreadsheet::Text(_) => true,
+        });
+        if let Some((_, UXGeoSpreadsheet::Text(sections))) = spreadsheet {
+            if let Ok(mut w) = std::fs::File::create(path) {
+                use std::io::Write;
+                writeln!(w, "Section,Hashcode,Sound,Text").ok();
+                for (section_idx, section) in sections.iter().enumerate() {
+                    for item in &section.entries {
+                        let escaped_text = item.text.replace('"', "\"\"");
+                        writeln!(w, "{},{:08x},{:08x},\"{}\"", section_idx, item.hashcode, item.sound_hashcode, escaped_text).ok();
+                    }
+                }
+                tracing::info!("Exported texts to CSV");
+            }
+        }
+    }
+
+    fn import_csv(&mut self, path: std::path::PathBuf) {
+        let spreadsheet = self.spreadsheets.iter_mut().find(|(_, v)| match v {
+            UXGeoSpreadsheet::Data(_) => false,
+            UXGeoSpreadsheet::Text(_) => true,
+        });
+        if let Some((_, UXGeoSpreadsheet::Text(sections))) = spreadsheet {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let mut lines = content.lines();
+                lines.next();
+                let mut imported = 0;
+                for line in lines {
+                    if line.is_empty() { continue; }
+                    let mut parts = line.splitn(4, ',');
+                    if let (Some(section_idx), Some(hashcode_str), Some(_sound), Some(text_part)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
+                        if let Ok(section_idx) = section_idx.parse::<usize>() {
+                            if let Ok(hashcode) = u32::from_str_radix(hashcode_str, 16) {
+                                let unescaped = text_part.trim_matches('"').replace("\"\"", "\"");
+                                if let Some(section) = sections.get_mut(section_idx) {
+                                    if let Some(item) = section.entries.iter_mut().find(|e| e.hashcode == hashcode) {
+                                        if item.text != unescaped {
+                                            item.text = unescaped;
+                                            imported += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                tracing::info!("Imported {} updated texts from CSV", imported);
+            }
+        }
     }
 }
