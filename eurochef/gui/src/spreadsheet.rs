@@ -11,6 +11,8 @@ pub struct TextItemList {
     pub spreadsheets: Vec<(Hashcode, UXGeoSpreadsheet)>,
     selected_section: usize,
     filtered_indices: Option<Vec<Vec<usize>>>,
+    last_edited_item: Option<(usize, usize)>,
+    should_scroll: bool,
 }
 
 impl TextItemList {
@@ -21,6 +23,8 @@ impl TextItemList {
             spreadsheets,
             selected_section: 0,
             filtered_indices: None,
+            last_edited_item: None,
+            should_scroll: false,
         }
     }
 
@@ -32,6 +36,9 @@ impl TextItemList {
             ui.label("Search: ");
             if ui.text_edit_singleline(&mut self.search_text).changed() {
                 update_filter = true;
+                if self.search_text.is_empty() && self.search_hashcode.is_empty() {
+                    self.should_scroll = true;
+                }
             }
             ui.label("Hashcode: ");
             if egui::TextEdit::singleline(&mut self.search_hashcode)
@@ -42,6 +49,15 @@ impl TextItemList {
                 .changed()
             {
                 update_filter = true;
+                if self.search_text.is_empty() && self.search_hashcode.is_empty() {
+                    self.should_scroll = true;
+                }
+            }
+            if ui.button("X").clicked() {
+                self.search_text.clear();
+                self.search_hashcode.clear();
+                update_filter = true;
+                self.should_scroll = true;
             }
             ui.separator();
             if ui.button("Export CSV").clicked() {
@@ -112,6 +128,8 @@ impl TextItemList {
         let section_hashes: Vec<u32> = sections.iter().map(|s| s.hashcode).collect();
         let filtered_indices = self.filtered_indices.as_ref().unwrap();
 
+        let mut edited_item = None;
+        let current_section = self.selected_section;
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
                 egui::ScrollArea::vertical()
@@ -144,11 +162,19 @@ impl TextItemList {
                 let text_height = egui::TextStyle::Body.resolve(ui.style()).size * 1.25;
                 
                 egui::ScrollArea::horizontal().show(ui, |ui| {
-                    let table = egui_extras::TableBuilder::new(ui)
+                    let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(true)
                         .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
                         .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
                         .column(egui_extras::Column::remainder().at_least(300.0).resizable(true).clip(true));
+
+                    if self.should_scroll {
+                        if let Some((section_idx, item_idx)) = self.last_edited_item {
+                            self.selected_section = section_idx;
+                            table = table.scroll_to_row(item_idx, Some(egui::Align::Center));
+                        }
+                        self.should_scroll = false;
+                    }
 
                     table
                         .header(20., |mut header| {
@@ -202,15 +228,19 @@ impl TextItemList {
                                 let text_edit = egui::TextEdit::singleline(&mut item.text)
                                     .desired_width(f32::INFINITY);
                                 if ui.add(text_edit).changed() {
-                                    // The item.text is already updated because we passed a mutable reference to TextEdit
+                                    edited_item = Some((current_section, item_index));
                                 }
                             })
                             .1
                             .context_menu(context_menu);
-                        })
+                        });
                     });
                 });
             });
+
+            if let Some(item) = edited_item {
+                self.last_edited_item = Some(item);
+            }
         });
     }
 
