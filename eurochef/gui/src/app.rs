@@ -487,10 +487,12 @@ impl EurochefApp {
 
         let mut all_text_items: Vec<TextItemInfo> = vec![];
         let endian;
+        let version;
         {
             let reader = Cursor::new(file_data.clone());
             let mut edb = EdbFile::new(Box::new(reader), platform)?;
             endian = edb.endian;
+            version = edb.header.version;
 
             let header = edb.header.clone();
             for s in &header.spreadsheet_list {
@@ -590,13 +592,17 @@ impl EurochefApp {
 
         for text_to_write in unique_strings {
             let new_chars: Vec<u16> = text_to_write.encode_utf16().collect();
-            let needed_bytes = (new_chars.len() + 1) * 2;
+            let mut needed_bytes = (new_chars.len() + 1) * 2;
+            if needed_bytes % 4 != 0 {
+                needed_bytes += 2;
+            }
             
             let mut allocated = None;
             for region in &mut merged_regions {
-                if region.end >= region.start + needed_bytes as u64 {
-                    allocated = Some(region.start);
-                    region.start += needed_bytes as u64;
+                let start_aligned = (region.start + 3) & !3;
+                if region.end >= start_aligned + needed_bytes as u64 {
+                    allocated = Some(start_aligned);
+                    region.start = start_aligned + needed_bytes as u64;
                     break;
                 }
             }
@@ -613,6 +619,9 @@ impl EurochefApp {
                 }
                 utf16_bytes.push(0);
                 utf16_bytes.push(0);
+                while utf16_bytes.len() < needed_bytes {
+                    utf16_bytes.push(0);
+                }
                 
                 let start = alloc_addr as usize;
                 let end = start + needed_bytes;
@@ -620,48 +629,38 @@ impl EurochefApp {
                     file_data[start..end].copy_from_slice(&utf16_bytes);
                 }
             } else {
-                let mut largest_region_idx = 0;
-                let mut max_space = 0;
-                for (idx, r) in merged_regions.iter().enumerate() {
-                    let space = r.end - r.start;
-                    if space > max_space {
-                        max_space = space;
-                        largest_region_idx = idx;
+                let alloc_addr = (file_data.len() as u64 + 3) & !3;
+                let padding_needed = (alloc_addr as usize).saturating_sub(file_data.len());
+                if padding_needed > 0 {
+                    file_data.extend(std::iter::repeat(0).take(padding_needed));
+                }
+
+                string_pool.insert(text_to_write.clone(), alloc_addr);
+                
+                let mut utf16_bytes = Vec::with_capacity(needed_bytes);
+                for wchar in &new_chars {
+                    match endian {
+                        Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                        Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
                     }
+                }
+                utf16_bytes.push(0);
+                utf16_bytes.push(0);
+                while utf16_bytes.len() < needed_bytes {
+                    utf16_bytes.push(0);
                 }
                 
-                if max_space >= 2 {
-                    let region = &mut merged_regions[largest_region_idx];
-                    let alloc_addr = region.start;
-                    let max_chars = (max_space as usize / 2) - 1;
-                    
-                    info!("String too long to fit anywhere! Truncating '{}' to {} chars", text_to_write, max_chars);
-                    strings_truncated += 1;
-                    
-                    let truncated_chars: Vec<u16> = new_chars.into_iter().take(max_chars).collect();
-                    let needed_bytes = (truncated_chars.len() + 1) * 2;
-                    
-                    region.start += needed_bytes as u64;
-                    string_pool.insert(text_to_write.clone(), alloc_addr);
-                    
-                    let mut utf16_bytes = Vec::with_capacity(needed_bytes);
-                    for wchar in &truncated_chars {
-                        match endian {
-                            Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
-                            Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
-                        }
-                    }
-                    utf16_bytes.push(0);
-                    utf16_bytes.push(0);
-                    
-                    let start = alloc_addr as usize;
-                    let end = start + needed_bytes;
-                    if end <= file_data.len() {
-                        file_data[start..end].copy_from_slice(&utf16_bytes);
-                    }
-                }
+                file_data.extend_from_slice(&utf16_bytes);
+                strings_patched += 1;
             }
         }
+
+        let new_size = file_data.len() as u32;
+        let size_bytes = match endian {
+            Endian::Little => new_size.to_le_bytes(),
+            Endian::Big => new_size.to_be_bytes(),
+        };
+        file_data[20..24].copy_from_slice(&size_bytes);
 
         for item in &all_text_items {
             if let Some(&addr) = string_pool.get(&item.final_text) {
@@ -673,17 +672,13 @@ impl EurochefApp {
                 let ptr_start = item.ptr_pos as usize;
                 file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
             }
-            
-            if item.was_patched {
-                strings_patched += 1;
-            }
         }
 
         std::fs::write(filename, &file_data).context("Failed to write patched EDB file")?;
 
         info!(
-            "Patched {} strings ({} truncated) in {}",
-            strings_patched, strings_truncated, filename
+            "Patched {} unique strings in {}. New file size: {} bytes",
+            string_pool.len(), filename, new_size
         );
 
         Ok(())

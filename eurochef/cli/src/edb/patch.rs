@@ -15,7 +15,7 @@ pub fn execute_patch_text(
     let mut translations = std::collections::HashMap::new();
     let csv_content = std::fs::read_to_string(csv_file).context("Failed to read CSV file")?;
 
-    for line in csv_content.lines().skip(1) {
+    for (i, line) in csv_content.lines().skip(1).enumerate() {
         if line.starts_with('#') || line.trim().is_empty() {
             continue;
         }
@@ -25,7 +25,7 @@ pub fn execute_patch_text(
             continue;
         }
 
-        let section_hash = u32::from_str_radix(parts[0], 16).unwrap_or(0);
+        let section_index = parts[0].parse::<usize>().unwrap_or(i);
         let item_hash = u32::from_str_radix(parts[1], 16).unwrap_or(0);
         let mut text = parts[3].trim();
 
@@ -34,7 +34,7 @@ pub fn execute_patch_text(
         }
 
         let processed_text = text.replace("\"\"", "\"").replace("\\n", "\n");
-        translations.insert((section_hash, item_hash), processed_text);
+        translations.insert((section_index, item_hash), processed_text);
     }
 
     info!("Loaded {} translations from CSV", translations.len());
@@ -56,10 +56,12 @@ pub fn execute_patch_text(
 
     let mut all_text_items: Vec<TextItemInfo> = vec![];
     let endian;
+    let version;
     {
         let reader = Cursor::new(file_data.clone());
         let mut edb = EdbFile::new(Box::new(reader), Platform::Pc)?;
         endian = edb.endian;
+        version = edb.header.version;
 
         let header = edb.header.clone();
         for s in &header.spreadsheet_list {
@@ -70,7 +72,7 @@ pub fn execute_patch_text(
             edb.seek(SeekFrom::Start(s.common.address as u64))?;
             let sheader = edb.read_type::<EXGeoSpreadSheet>(edb.endian)?;
 
-            for s_section in sheader.sections {
+            for (s_idx, s_section) in sheader.sections.iter().enumerate() {
                 let refpointer = &edb.header.refpointer_list[s_section.refpointer_index as usize];
                 edb.seek(SeekFrom::Start(refpointer.address as u64 + 4))?;
                 let text_count = edb.read_type::<u32>(edb.endian)?;
@@ -83,7 +85,7 @@ pub fn execute_patch_text(
                     let original_bytes = (current_text.encode_utf16().count() + 1) * 2;
                     
                     let mut was_patched = false;
-                    let final_text = match translations.get(&(s_section.hashcode, item.hashcode)) {
+                    let final_text = match translations.get(&(s_idx, item.hashcode)) {
                         Some(new_text) => {
                             if current_text.trim() != new_text.as_str() {
                                 was_patched = true;
@@ -107,7 +109,6 @@ pub fn execute_patch_text(
         }
     }
 
-    // Gather all memory regions occupied by strings
     let mut regions: Vec<Region> = all_text_items.iter().map(|item| Region {
         start: item.original_addr,
         end: item.original_addr + item.original_bytes as u64,
@@ -134,7 +135,6 @@ pub fn execute_patch_text(
     let mut strings_patched = 0;
     let mut strings_truncated = 0;
 
-    // Clear all merged regions with zero to avoid garbage data
     for region in &merged_regions {
         let start = region.start as usize;
         let end = region.end as usize;
@@ -145,8 +145,6 @@ pub fn execute_patch_text(
         }
     }
 
-    // To maximize bin packing efficiency, we can sort the text items we need to allocate by length descending
-    // However, since we just iterate all_text_items, we can collect unique strings first.
     let mut unique_strings: Vec<String> = vec![];
     let mut seen = std::collections::HashSet::new();
     for item in &all_text_items {
@@ -155,16 +153,19 @@ pub fn execute_patch_text(
         }
     }
 
-    // Pre-allocate strings
     for text_to_write in unique_strings {
         let new_chars: Vec<u16> = text_to_write.encode_utf16().collect();
-        let needed_bytes = (new_chars.len() + 1) * 2;
+        let mut needed_bytes = (new_chars.len() + 1) * 2;
+        if needed_bytes % 4 != 0 {
+            needed_bytes += 2;
+        }
         
         let mut allocated = None;
         for region in &mut merged_regions {
-            if region.end >= region.start + needed_bytes as u64 {
-                allocated = Some(region.start);
-                region.start += needed_bytes as u64; // shrink the available free space
+            let start_aligned = (region.start + 3) & !3;
+            if region.end >= start_aligned + needed_bytes as u64 {
+                allocated = Some(start_aligned);
+                region.start = start_aligned + needed_bytes as u64; 
                 break;
             }
         }
@@ -181,6 +182,9 @@ pub fn execute_patch_text(
             }
             utf16_bytes.push(0);
             utf16_bytes.push(0);
+            while utf16_bytes.len() < needed_bytes {
+                utf16_bytes.push(0);
+            }
             
             let start = alloc_addr as usize;
             let end = start + needed_bytes;
@@ -188,54 +192,39 @@ pub fn execute_patch_text(
                 file_data[start..end].copy_from_slice(&utf16_bytes);
             }
         } else {
-            // Find largest available region for fallback
-            let mut largest_region_idx = 0;
-            let mut max_space = 0;
-            for (i, r) in merged_regions.iter().enumerate() {
-                let space = r.end - r.start;
-                if space > max_space {
-                    max_space = space;
-                    largest_region_idx = i;
+            let alloc_addr = (file_data.len() as u64 + 3) & !3;
+            let padding_needed = (alloc_addr as usize).saturating_sub(file_data.len());
+            if padding_needed > 0 {
+                file_data.extend(std::iter::repeat(0).take(padding_needed));
+            }
+
+            string_pool.insert(text_to_write.clone(), alloc_addr);
+            
+            let mut utf16_bytes = Vec::with_capacity(needed_bytes);
+            for wchar in &new_chars {
+                match endian {
+                    Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                    Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
                 }
+            }
+            utf16_bytes.push(0);
+            utf16_bytes.push(0);
+            while utf16_bytes.len() < needed_bytes {
+                utf16_bytes.push(0);
             }
             
-            if max_space >= 2 {
-                let region = &mut merged_regions[largest_region_idx];
-                let alloc_addr = region.start;
-                let max_chars = (max_space as usize / 2) - 1;
-                
-                warn!("String too long to fit anywhere! Truncating '{}' to {} chars", text_to_write, max_chars);
-                strings_truncated += 1;
-                
-                let truncated_chars: Vec<u16> = new_chars.into_iter().take(max_chars).collect();
-                let needed_bytes = (truncated_chars.len() + 1) * 2;
-                
-                region.start += needed_bytes as u64;
-                string_pool.insert(text_to_write.clone(), alloc_addr);
-                
-                let mut utf16_bytes = Vec::with_capacity(needed_bytes);
-                for wchar in &truncated_chars {
-                    match endian {
-                        Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
-                        Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
-                    }
-                }
-                utf16_bytes.push(0);
-                utf16_bytes.push(0);
-                
-                let start = alloc_addr as usize;
-                let end = start + needed_bytes;
-                if end <= file_data.len() {
-                    file_data[start..end].copy_from_slice(&utf16_bytes);
-                }
-            } else {
-                warn!("CRITICAL: Out of string memory! Cannot fit '{}'", text_to_write);
-                // Can't even fit a null char, very bad.
-            }
+            file_data.extend_from_slice(&utf16_bytes);
+            strings_patched += 1;
         }
     }
 
-    // Now update all pointers
+    let new_size = file_data.len() as u32;
+    let size_bytes = match endian {
+        Endian::Little => new_size.to_le_bytes(),
+        Endian::Big => new_size.to_be_bytes(),
+    };
+    file_data[20..24].copy_from_slice(&size_bytes);
+
     for item in &all_text_items {
         if let Some(&addr) = string_pool.get(&item.final_text) {
             let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
@@ -246,18 +235,14 @@ pub fn execute_patch_text(
             let ptr_start = item.ptr_pos as usize;
             file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
         }
-        
-        if item.was_patched {
-            strings_patched += 1;
-        }
     }
 
     let output_path = output_filename.unwrap_or(filename);
     std::fs::write(&output_path, &file_data).context("Failed to write patched EDB file")?;
 
     info!(
-        "Patched {} strings ({} truncated). File saved to {}",
-        strings_patched, strings_truncated, output_path
+        "Patched {} unique strings. New file size: {} bytes. File saved to {}",
+        string_pool.len(), new_size, output_path
     );
 
     Ok(())
