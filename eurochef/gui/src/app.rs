@@ -449,7 +449,6 @@ impl EurochefApp {
         let spreadsheetlist = self.spreadsheetlist.as_ref().context("No spreadsheets loaded")?;
         let platform = self.current_platform.unwrap_or(self.selected_platform);
 
-        // Find the FIRST text spreadsheet, just like the GUI does
         let (spreadsheet_hash, spreadsheet) = spreadsheetlist.spreadsheets.iter().find(|(_, v)| match v {
             UXGeoSpreadsheet::Data(_) => false,
             UXGeoSpreadsheet::Text(_) => true,
@@ -465,19 +464,22 @@ impl EurochefApp {
         }
 
         let mut file_data = std::fs::read(filename).context("Failed to read EDB file")?;
-        let mut patch_actions = vec![];
+
+        struct PatchAction {
+            string_ptr_pos: u64,
+            new_text: String,
+            string_addr: u64,
+            original_char_count: usize,
+        }
+
+        let mut patch_actions: Vec<PatchAction> = vec![];
         let endian;
-        let original_size;
-        let original_base_size;
         {
             let reader = Cursor::new(file_data.clone());
             let mut edb = EdbFile::new(Box::new(reader), platform)?;
             endian = edb.endian;
-            original_size = edb.header.file_size;
-            original_base_size = edb.header.base_file_size;
 
             let header = edb.header.clone();
-            // Find the SAME spreadsheet in the file that we have in memory
             for s in &header.spreadsheet_list {
                 if s.stype != 1 || s.common.hashcode != *spreadsheet_hash {
                     continue;
@@ -498,18 +500,13 @@ impl EurochefApp {
 
                         if let Some(new_text) = translations.get(&(i, item.hashcode)) {
                             let current_text = item.string.to_string();
-                            if &current_text.trim() != new_text {
-                                let addr = item.string.offset_absolute();
-                                let original_len = current_text.encode_utf16().count();
-                                let mut extra_space = 0;
-                                let mut check_pos = (addr + (original_len + 1) as u64 * 2) as usize;
-                                // Scan for trailing nulls to see if we can fit a longer string in-place
-                                while check_pos + 1 < file_data.len() && file_data[check_pos] == 0 && file_data[check_pos+1] == 0 {
-                                    extra_space += 1;
-                                    check_pos += 2;
-                                    if extra_space > 256 { break; } 
-                                }
-                                patch_actions.push((item_pos + 4, new_text.clone(), addr, original_len + extra_space));
+                            if current_text.trim() != new_text.as_str() {
+                                patch_actions.push(PatchAction {
+                                    string_ptr_pos: item_pos + 4,
+                                    new_text: new_text.clone(),
+                                    string_addr: item.string.offset_absolute(),
+                                    original_char_count: current_text.encode_utf16().count(),
+                                });
                             }
                         }
                     }
@@ -522,86 +519,65 @@ impl EurochefApp {
             return Ok(());
         }
 
-        // Align to 4 bytes before appending
-        while file_data.len() % 4 != 0 {
-            file_data.push(0);
-        }
-
-        let mut string_offsets = std::collections::HashMap::new();
         let mut strings_patched = 0;
-        for (ptr_pos, new_text, original_addr, original_space) in patch_actions {
-            let new_len = new_text.encode_utf16().count();
-            let string_address = if let Some(&addr) = string_offsets.get(&new_text) {
-                addr
-            } else if new_len <= original_space {
-                // In-place replacement
-                let mut utf16_text: Vec<u16> = new_text.encode_utf16().collect();
-                while utf16_text.len() <= original_space {
-                    utf16_text.push(0);
-                }
-                for (i, &wchar) in utf16_text.iter().enumerate() {
-                    let bytes = match endian {
-                        Endian::Little => wchar.to_le_bytes(),
-                        Endian::Big => wchar.to_be_bytes(),
-                    };
-                    let start = (original_addr + i as u64 * 2) as usize;
-                    file_data[start..start + 2].copy_from_slice(&bytes);
-                }
-                string_offsets.insert(new_text.clone(), original_addr);
-                original_addr
+        let mut strings_truncated = 0;
+
+        for action in patch_actions {
+            let new_chars: Vec<u16> = action.new_text.encode_utf16().collect();
+            let new_char_count = new_chars.len();
+
+            let (chars_to_write, was_truncated) = if new_char_count <= action.original_char_count {
+                (new_chars, false)
             } else {
-                // Append to end
-                while file_data.len() % 16 != 0 {
-                    file_data.push(0);
-                }
-                let addr = file_data.len() as u64;
-                let utf16_text: Vec<u16> = new_text.encode_utf16().chain(std::iter::once(0)).collect();
-                for &wchar in &utf16_text {
-                    match endian {
-                        Endian::Little => file_data.extend_from_slice(&wchar.to_le_bytes()),
-                        Endian::Big => file_data.extend_from_slice(&wchar.to_be_bytes()),
-                    }
-                }
-                string_offsets.insert(new_text.clone(), addr);
-                addr
+                info!(
+                    "String at 0x{:x} too long ({} > {}), truncating",
+                    action.string_addr, new_char_count, action.original_char_count
+                );
+                (new_chars[..action.original_char_count].to_vec(), true)
             };
 
-            let relative_offset = (string_address as i64 - ptr_pos as i64) as i32;
+            let total_slots = action.original_char_count + 1;
+            let mut utf16_bytes: Vec<u8> = Vec::with_capacity(total_slots * 2);
+            for wchar in &chars_to_write {
+                match endian {
+                    Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                    Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+                }
+            }
+            for _ in chars_to_write.len()..total_slots {
+                utf16_bytes.push(0);
+                utf16_bytes.push(0);
+            }
+
+            let start = action.string_addr as usize;
+            let end = start + utf16_bytes.len();
+            if end > file_data.len() {
+                info!("String at 0x{:x} out of bounds, skipping", action.string_addr);
+                continue;
+            }
+            file_data[start..end].copy_from_slice(&utf16_bytes);
+
+            let relative_offset = (action.string_addr as i64 - action.string_ptr_pos as i64) as i32;
             let offset_bytes = match endian {
                 Endian::Little => relative_offset.to_le_bytes(),
                 Endian::Big => relative_offset.to_be_bytes(),
             };
+            let ptr_start = action.string_ptr_pos as usize;
+            file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
 
-            file_data[ptr_pos as usize..ptr_pos as usize + 4].copy_from_slice(&offset_bytes);
             strings_patched += 1;
+            if was_truncated {
+                strings_truncated += 1;
+            }
         }
 
-        // Align the whole file to 2048 bytes (sector size)
-        while file_data.len() % 2048 != 0 {
-            file_data.push(0);
-        }
-
-        let final_size = file_data.len() as u32;
-        let size_bytes = match endian {
-            Endian::Little => final_size.to_le_bytes(),
-            Endian::Big => final_size.to_be_bytes(),
-        };
-
-        // Correct EDB header offsets:
-        // 0x0c - flags
-        // 0x10 - build date/time
-        // 0x14 - file size
-        // 0x18 - base size
-        file_data[0x14..0x18].copy_from_slice(&size_bytes);
-        file_data[0x18..0x1c].copy_from_slice(&size_bytes);
-
-        std::fs::write(filename, file_data).context("Failed to write patched EDB file")?;
+        std::fs::write(filename, &file_data).context("Failed to write patched EDB file")?;
 
         info!(
-            "Successfully patched {} strings in {}. New file size: {} bytes",
-            strings_patched, filename, final_size
+            "Patched {} strings ({} truncated) in {}",
+            strings_patched, strings_truncated, filename
         );
-        
+
         Ok(())
     }
 }
