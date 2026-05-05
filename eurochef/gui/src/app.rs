@@ -465,14 +465,22 @@ impl EurochefApp {
 
         let mut file_data = std::fs::read(filename).context("Failed to read EDB file")?;
 
-        struct PatchAction {
-            string_ptr_pos: u64,
-            new_text: String,
-            string_addr: u64,
-            original_char_count: usize,
+        #[derive(Debug)]
+        struct TextItemInfo {
+            ptr_pos: u64,
+            original_addr: u64,
+            original_bytes: usize,
+            final_text: String,
+            was_patched: bool,
         }
 
-        let mut patch_actions: Vec<PatchAction> = vec![];
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+        struct Region {
+            start: u64,
+            end: u64,
+        }
+
+        let mut all_text_items: Vec<TextItemInfo> = vec![];
         let endian;
         {
             let reader = Cursor::new(file_data.clone());
@@ -481,13 +489,17 @@ impl EurochefApp {
 
             let header = edb.header.clone();
             for s in &header.spreadsheet_list {
-                if s.stype != 1 || s.common.hashcode != *spreadsheet_hash {
+                if s.stype != 1 {
                     continue;
                 }
 
-                info!("Patching spreadsheet 0x{:x}", s.common.hashcode);
                 edb.seek(SeekFrom::Start(s.common.address as u64))?;
                 let sheader = edb.read_type::<EXGeoSpreadSheet>(edb.endian)?;
+
+                let is_target_spreadsheet = s.common.hashcode == *spreadsheet_hash;
+                if is_target_spreadsheet {
+                    info!("Patching targeted spreadsheet 0x{:x}", s.common.hashcode);
+                }
 
                 for (i, s_section) in sheader.sections.into_iter().enumerate() {
                     let refpointer = &edb.header.refpointer_list[s_section.refpointer_index as usize];
@@ -498,76 +510,167 @@ impl EurochefApp {
                         let item_pos = edb.stream_position()?;
                         let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
 
-                        if let Some(new_text) = translations.get(&(i, item.hashcode)) {
-                            let current_text = item.string.to_string();
-                            if current_text.trim() != new_text.as_str() {
-                                patch_actions.push(PatchAction {
-                                    string_ptr_pos: item_pos + 4,
-                                    new_text: new_text.clone(),
-                                    string_addr: item.string.offset_absolute(),
-                                    original_char_count: current_text.encode_utf16().count(),
-                                });
+                        let current_text = item.string.to_string();
+                        let original_bytes = (current_text.encode_utf16().count() + 1) * 2;
+                        
+                        let mut was_patched = false;
+                        let final_text = if is_target_spreadsheet {
+                            match translations.get(&(i, item.hashcode)) {
+                                Some(new_text) => {
+                                    if current_text.trim() != new_text.as_str() {
+                                        was_patched = true;
+                                        new_text.clone()
+                                    } else {
+                                        current_text
+                                    }
+                                },
+                                None => current_text,
                             }
-                        }
+                        } else {
+                            current_text
+                        };
+
+                        all_text_items.push(TextItemInfo {
+                            ptr_pos: item_pos + 4,
+                            original_addr: item.string.offset_absolute(),
+                            original_bytes,
+                            final_text,
+                            was_patched,
+                        });
                     }
                 }
             }
         }
 
-        if patch_actions.is_empty() {
-            info!("No changes detected. Nothing to patch.");
-            return Ok(());
+        let mut regions: Vec<Region> = all_text_items.iter().map(|item| Region {
+            start: item.original_addr,
+            end: item.original_addr + item.original_bytes as u64,
+        }).collect();
+
+        regions.sort_by_key(|r| r.start);
+        let mut merged_regions: Vec<Region> = vec![];
+        for r in regions {
+            if let Some(last) = merged_regions.last_mut() {
+                if r.start <= last.end {
+                    if r.end > last.end {
+                        last.end = r.end;
+                    }
+                    continue;
+                }
+            }
+            merged_regions.push(r);
         }
 
+        let mut string_pool = std::collections::HashMap::new();
         let mut strings_patched = 0;
         let mut strings_truncated = 0;
 
-        for action in patch_actions {
-            let new_chars: Vec<u16> = action.new_text.encode_utf16().collect();
-            let new_char_count = new_chars.len();
-
-            let (chars_to_write, was_truncated) = if new_char_count <= action.original_char_count {
-                (new_chars, false)
-            } else {
-                info!(
-                    "String at 0x{:x} too long ({} > {}), truncating",
-                    action.string_addr, new_char_count, action.original_char_count
-                );
-                (new_chars[..action.original_char_count].to_vec(), true)
-            };
-
-            let total_slots = action.original_char_count + 1;
-            let mut utf16_bytes: Vec<u8> = Vec::with_capacity(total_slots * 2);
-            for wchar in &chars_to_write {
-                match endian {
-                    Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
-                    Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+        for region in &merged_regions {
+            let start = region.start as usize;
+            let end = region.end as usize;
+            if end <= file_data.len() {
+                for b in file_data[start..end].iter_mut() {
+                    *b = 0;
                 }
             }
-            for _ in chars_to_write.len()..total_slots {
+        }
+
+        let mut unique_strings: Vec<String> = vec![];
+        let mut seen = std::collections::HashSet::new();
+        for item in &all_text_items {
+            if seen.insert(item.final_text.clone()) {
+                unique_strings.push(item.final_text.clone());
+            }
+        }
+
+        for text_to_write in unique_strings {
+            let new_chars: Vec<u16> = text_to_write.encode_utf16().collect();
+            let needed_bytes = (new_chars.len() + 1) * 2;
+            
+            let mut allocated = None;
+            for region in &mut merged_regions {
+                if region.end >= region.start + needed_bytes as u64 {
+                    allocated = Some(region.start);
+                    region.start += needed_bytes as u64;
+                    break;
+                }
+            }
+            
+            if let Some(alloc_addr) = allocated {
+                string_pool.insert(text_to_write.clone(), alloc_addr);
+                
+                let mut utf16_bytes = Vec::with_capacity(needed_bytes);
+                for wchar in &new_chars {
+                    match endian {
+                        Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                        Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+                    }
+                }
                 utf16_bytes.push(0);
                 utf16_bytes.push(0);
+                
+                let start = alloc_addr as usize;
+                let end = start + needed_bytes;
+                if end <= file_data.len() {
+                    file_data[start..end].copy_from_slice(&utf16_bytes);
+                }
+            } else {
+                let mut largest_region_idx = 0;
+                let mut max_space = 0;
+                for (idx, r) in merged_regions.iter().enumerate() {
+                    let space = r.end - r.start;
+                    if space > max_space {
+                        max_space = space;
+                        largest_region_idx = idx;
+                    }
+                }
+                
+                if max_space >= 2 {
+                    let region = &mut merged_regions[largest_region_idx];
+                    let alloc_addr = region.start;
+                    let max_chars = (max_space as usize / 2) - 1;
+                    
+                    info!("String too long to fit anywhere! Truncating '{}' to {} chars", text_to_write, max_chars);
+                    strings_truncated += 1;
+                    
+                    let truncated_chars: Vec<u16> = new_chars.into_iter().take(max_chars).collect();
+                    let needed_bytes = (truncated_chars.len() + 1) * 2;
+                    
+                    region.start += needed_bytes as u64;
+                    string_pool.insert(text_to_write.clone(), alloc_addr);
+                    
+                    let mut utf16_bytes = Vec::with_capacity(needed_bytes);
+                    for wchar in &truncated_chars {
+                        match endian {
+                            Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                            Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+                        }
+                    }
+                    utf16_bytes.push(0);
+                    utf16_bytes.push(0);
+                    
+                    let start = alloc_addr as usize;
+                    let end = start + needed_bytes;
+                    if end <= file_data.len() {
+                        file_data[start..end].copy_from_slice(&utf16_bytes);
+                    }
+                }
             }
+        }
 
-            let start = action.string_addr as usize;
-            let end = start + utf16_bytes.len();
-            if end > file_data.len() {
-                info!("String at 0x{:x} out of bounds, skipping", action.string_addr);
-                continue;
+        for item in &all_text_items {
+            if let Some(&addr) = string_pool.get(&item.final_text) {
+                let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
+                let offset_bytes = match endian {
+                    Endian::Little => relative_offset.to_le_bytes(),
+                    Endian::Big => relative_offset.to_be_bytes(),
+                };
+                let ptr_start = item.ptr_pos as usize;
+                file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
             }
-            file_data[start..end].copy_from_slice(&utf16_bytes);
-
-            let relative_offset = (action.string_addr as i64 - action.string_ptr_pos as i64) as i32;
-            let offset_bytes = match endian {
-                Endian::Little => relative_offset.to_le_bytes(),
-                Endian::Big => relative_offset.to_be_bytes(),
-            };
-            let ptr_start = action.string_ptr_pos as usize;
-            file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
-
-            strings_patched += 1;
-            if was_truncated {
-                strings_truncated += 1;
+            
+            if item.was_patched {
+                strings_patched += 1;
             }
         }
 
