@@ -71,9 +71,20 @@ pub fn execute_patch_text(
         }
     }
 
+    // Align to 4 bytes before appending
+    while file_data.len() % 4 != 0 {
+        file_data.push(0);
+    }
+
     let mut strings_patched = 0;
     for (ptr_pos, new_text) in patch_actions {
         let utf16_text: Vec<u16> = new_text.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // Align each string to 4 bytes
+        while file_data.len() % 4 != 0 {
+            file_data.push(0);
+        }
+
         let string_address = file_data.len() as u64;
 
         for &wchar in &utf16_text {
@@ -99,8 +110,8 @@ pub fn execute_patch_text(
         Endian::Big => final_size.to_be_bytes(),
     };
 
-    file_data[0x10..0x14].copy_from_slice(&size_bytes);
     file_data[0x14..0x18].copy_from_slice(&size_bytes);
+    file_data[0x18..0x1c].copy_from_slice(&size_bytes);
 
     let output_path = output_filename.unwrap_or(filename);
     std::fs::write(&output_path, file_data).context("Failed to write patched EDB file")?;

@@ -1,7 +1,8 @@
 use std::{
     collections::hash_map,
     fs::File,
-    io::{BufReader, Cursor, Read, Seek},
+    io::{BufReader, Cursor, Read, Seek, SeekFrom},
+    path::Path,
     sync::Arc,
 };
 
@@ -9,7 +10,7 @@ use crossbeam::atomic::AtomicCell;
 use eframe::CreationContext;
 use egui::{mutex::RwLock, Color32, FontData, FontDefinitions, NumExt};
 use eurochef_edb::{
-    binrw::{BinReaderExt, Endian},
+    binrw::{BinReaderExt, BinWriterExt, Endian},
     edb::EdbFile,
     versions::Platform,
     Hashcode, HashcodeUtils,
@@ -19,8 +20,11 @@ use eurochef_shared::{
     hashcodes::parse_hashcodes, script::UXGeoScript, spreadsheets::UXGeoSpreadsheet,
     textures::UXGeoTexture,
 };
+use eurochef_edb::text::{EXGeoSpreadSheet, EXGeoTextItem};
+use anyhow::Context;
 use instant::Instant;
 use nohash_hasher::IntMap;
+use tracing::{debug, info};
 
 use crate::{
     entities::{self},
@@ -72,6 +76,8 @@ pub struct EurochefApp {
     path_cache: IntMap<Hashcode, String>,
     render_store: Arc<RwLock<RenderStore>>,
     game: String,
+    pub current_file: Option<String>,
+    pub current_platform: Option<Platform>,
 }
 
 impl EurochefApp {
@@ -97,17 +103,17 @@ impl EurochefApp {
         cc.egui_ctx.set_fonts(fonts);
 
         #[cfg(not(any(target_arch = "wasm32", target_os = "macos")))]
-        unsafe {
-            use glow::HasContext;
-            let gl = cc.gl.as_ref().unwrap();
+        // unsafe {
+        //     use glow::HasContext;
+        //     let gl = cc.gl.as_ref().unwrap();
 
-            gl.enable(glow::DEBUG_OUTPUT);
-            gl.enable(glow::DEBUG_OUTPUT_SYNCHRONOUS);
-            gl.debug_message_callback(|source, ty, id, severity, msg| {
-                println!("OpenGL s={source} t={ty} i={id} s={severity}: {msg}");
-            });
-            gl.debug_message_control(glow::DONT_CARE, glow::DONT_CARE, glow::DONT_CARE, &[], true);
-        }
+        //     gl.enable(glow::DEBUG_OUTPUT);
+        //     gl.enable(glow::DEBUG_OUTPUT_SYNCHRONOUS);
+        //     gl.debug_message_callback(|source, ty, id, severity, msg| {
+        //         println!("OpenGL s={source} t={ty} i={id} s={severity}: {msg}");
+        //     });
+        //     gl.debug_message_control(glow::DONT_CARE, glow::DONT_CARE, glow::DONT_CARE, &[], true);
+        // }
 
         let hashcodes = if let Some(hashcodes_path) = hashcodes_path {
             let hfs = std::fs::read_to_string(hashcodes_path).unwrap();
@@ -136,6 +142,8 @@ impl EurochefApp {
             hashcodes: Arc::new(hashcodes),
             game: String::new(),
             show_profiler: false,
+            current_file: None,
+            current_platform: None,
         };
 
         if let Some(path) = path {
@@ -197,10 +205,11 @@ impl EurochefApp {
             info!("Indexed {} EDBs", self.path_cache.len());
         }
 
-        let mut f = File::open(path)?;
+        let mut f = File::open(&path)?;
         let mut data = vec![];
         f.read_to_end(&mut data)?;
         self.pending_file = Some((data, platform));
+        self.current_file = Some(path.as_ref().to_string_lossy().to_string());
 
         Ok(())
     }
@@ -429,8 +438,139 @@ impl EurochefApp {
             start.elapsed().as_secs_f32()
         );
 
+        self.current_platform = Some(platform);
         self.state = AppState::Ready;
 
+        Ok(())
+    }
+
+    pub fn save_spreadsheets(&mut self) -> anyhow::Result<()> {
+        let filename = self.current_file.as_ref().context("No file loaded")?;
+        let spreadsheetlist = self.spreadsheetlist.as_ref().context("No spreadsheets loaded")?;
+        let platform = self.current_platform.unwrap_or(self.selected_platform);
+
+        // Find the FIRST text spreadsheet, just like the GUI does
+        let (spreadsheet_hash, spreadsheet) = spreadsheetlist.spreadsheets.iter().find(|(_, v)| match v {
+            UXGeoSpreadsheet::Data(_) => false,
+            UXGeoSpreadsheet::Text(_) => true,
+        }).context("No text spreadsheet found to save")?;
+
+        let mut translations = std::collections::HashMap::new();
+        if let UXGeoSpreadsheet::Text(sections) = spreadsheet {
+            for section in sections {
+                for item in &section.entries {
+                    translations.insert((section.index, item.hashcode), item.text.trim().to_string());
+                }
+            }
+        }
+
+        let mut file_data = std::fs::read(filename).context("Failed to read EDB file")?;
+        let mut patch_actions = vec![];
+        let endian;
+        {
+            let reader = Cursor::new(file_data.clone());
+            let mut edb = EdbFile::new(Box::new(reader), platform)?;
+            endian = edb.endian;
+
+            let header = edb.header.clone();
+            // Find the SAME spreadsheet in the file that we have in memory
+            for s in &header.spreadsheet_list {
+                if s.stype != 1 || s.common.hashcode != *spreadsheet_hash {
+                    continue;
+                }
+
+                info!("Patching spreadsheet 0x{:x}", s.common.hashcode);
+                edb.seek(SeekFrom::Start(s.common.address as u64))?;
+                let sheader = edb.read_type::<EXGeoSpreadSheet>(edb.endian)?;
+
+                for (i, s_section) in sheader.sections.into_iter().enumerate() {
+                    let refpointer = &edb.header.refpointer_list[s_section.refpointer_index as usize];
+                    edb.seek(SeekFrom::Start(refpointer.address as u64 + 4))?;
+                    let text_count = edb.read_type::<u32>(edb.endian)?;
+
+                    for _i in 0..text_count {
+                        let item_pos = edb.stream_position()?;
+                        let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
+
+                        if let Some(new_text) = translations.get(&(i, item.hashcode)) {
+                            let current_text = item.string.to_string().trim().to_string();
+                            if &current_text != new_text {
+                                patch_actions.push((item_pos + 4, new_text.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if patch_actions.is_empty() {
+            info!("No changes detected. Nothing to patch.");
+            return Ok(());
+        }
+
+        // Align to 4 bytes before appending
+        while file_data.len() % 4 != 0 {
+            file_data.push(0);
+        }
+
+        let mut strings_patched = 0;
+        for (ptr_pos, new_text) in patch_actions {
+            let utf16_text: Vec<u16> = new_text
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+
+            // Align to 4 bytes for each string start
+            while file_data.len() % 4 != 0 {
+                file_data.push(0);
+            }
+
+            let string_address = file_data.len() as u64;
+
+            for &wchar in &utf16_text {
+                match endian {
+                    Endian::Little => file_data.extend_from_slice(&wchar.to_le_bytes()),
+                    Endian::Big => file_data.extend_from_slice(&wchar.to_be_bytes()),
+                }
+            }
+
+            let relative_offset = (string_address as i64 - ptr_pos as i64) as i32;
+            let offset_bytes = match endian {
+                Endian::Little => relative_offset.to_le_bytes(),
+                Endian::Big => relative_offset.to_be_bytes(),
+            };
+
+            // Diagnostic log
+            info!(
+                "Patching string at 0x{:x} (ptr at 0x{:x}) with offset 0x{:x} ('{}')",
+                string_address, ptr_pos, relative_offset, new_text
+            );
+
+            file_data[ptr_pos as usize..ptr_pos as usize + 4].copy_from_slice(&offset_bytes);
+            strings_patched += 1;
+        }
+
+        let final_size = file_data.len() as u32;
+        let size_bytes = match endian {
+            Endian::Little => final_size.to_le_bytes(),
+            Endian::Big => final_size.to_be_bytes(),
+        };
+
+        // Correct EDB header offsets:
+        // 0x0c - flags
+        // 0x10 - build date/time
+        // 0x14 - file size
+        // 0x18 - base size
+        file_data[0x14..0x18].copy_from_slice(&size_bytes);
+        file_data[0x18..0x1c].copy_from_slice(&size_bytes);
+
+        std::fs::write(filename, file_data).context("Failed to write patched EDB file")?;
+
+        info!(
+            "Successfully patched {} strings in {}. New file size: {} bytes",
+            strings_patched, filename, final_size
+        );
+        
         Ok(())
     }
 }
@@ -452,8 +592,9 @@ impl eframe::App for EurochefApp {
             });
 
         if let Some((data, load_path)) = self.load_input.take() {
-            let platform = Platform::from_path(load_path);
+            let platform = Platform::from_path(&load_path);
             self.pending_file = Some((data, platform));
+            self.current_file = Some(load_path);
         }
 
         if let Some((data, platform)) = self.pending_file.as_ref() {
@@ -471,21 +612,7 @@ impl eframe::App for EurochefApp {
             }
         }
 
-        let Self {
-            state,
-            current_panel,
-            spreadsheetlist,
-            fileinfo,
-            textures,
-            load_input,
-            entities,
-            scripts,
-            maps,
-            selected_platform,
-            ..
-        } = self;
-
-        let load_clone = load_input.clone();
+        let load_clone = self.load_input.clone();
 
         // swy: queue a load for the first drag-and-dropped file we encounter here
         ctx.input(|i| {
@@ -556,6 +683,15 @@ impl eframe::App for EurochefApp {
 
                         ui.close_menu()
                     }
+
+                    if let Some(current_file) = &self.current_file {
+                        if ui.button(format!("Save {}", Path::new(current_file).file_name().unwrap().to_string_lossy())).clicked() {
+                            if let Err(e) = self.save_spreadsheets() {
+                                self.state = AppState::Error(e);
+                            }
+                            ui.close_menu();
+                        }
+                    }
                 });
 
                 if ui.button("Profiler").clicked() {
@@ -577,7 +713,7 @@ impl eframe::App for EurochefApp {
         });
 
         // Run the app at refresh rate on the texture panel (for animated textures)
-        match current_panel {
+        match self.current_panel {
             Panel::Entities | Panel::Textures | Panel::Maps | Panel::Scripts => {
                 ctx.request_repaint()
             }
@@ -650,7 +786,7 @@ impl eframe::App for EurochefApp {
             });
         }
 
-        match state {
+        match &self.state {
             AppState::Ready => {}
             AppState::Loading(s) => {
                 egui::Window::new("Loading")
@@ -680,34 +816,34 @@ impl eframe::App for EurochefApp {
                         ui.horizontal(|ui| {
                             ui.strong("Platform: ");
                             egui::ComboBox::from_label("")
-                                .selected_text(selected_platform.to_string())
+                                .selected_text(self.selected_platform.to_string())
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
-                                        selected_platform,
+                                        &mut self.selected_platform,
                                         Platform::GameCube,
                                         "GameCube",
                                     );
-                                    ui.selectable_value(selected_platform, Platform::Pc, "PC");
+                                    ui.selectable_value(&mut self.selected_platform, Platform::Pc, "PC");
                                     ui.selectable_value(
-                                        selected_platform,
+                                        &mut self.selected_platform,
                                         Platform::Ps2,
                                         "PlayStation 2",
                                     );
                                     ui.selectable_value(
-                                        selected_platform,
+                                        &mut self.selected_platform,
                                         Platform::Ps3,
                                         "PlayStation 3",
                                     );
                                     ui.selectable_value(
-                                        selected_platform,
+                                        &mut self.selected_platform,
                                         Platform::ThreeDS,
                                         "3DS",
                                     );
-                                    ui.selectable_value(selected_platform, Platform::Wii, "Wii");
-                                    ui.selectable_value(selected_platform, Platform::WiiU, "Wii U");
-                                    ui.selectable_value(selected_platform, Platform::Xbox, "Xbox");
+                                    ui.selectable_value(&mut self.selected_platform, Platform::Wii, "Wii");
+                                    ui.selectable_value(&mut self.selected_platform, Platform::WiiU, "Wii U");
+                                    ui.selectable_value(&mut self.selected_platform, Platform::Xbox, "Xbox");
                                     ui.selectable_value(
-                                        selected_platform,
+                                        &mut self.selected_platform,
                                         Platform::Xbox360,
                                         "Xbox 360",
                                     );
@@ -717,7 +853,7 @@ impl eframe::App for EurochefApp {
                         ui.horizontal(|ui| {
                             if ui.button("Load").clicked() {
                                 if let Some((_, platform)) = self.pending_file.as_mut() {
-                                    *platform = Some(*selected_platform);
+                                    *platform = Some(self.selected_platform);
                                 }
                                 self.state = AppState::Loading("Loading file".to_string());
                             }
@@ -763,64 +899,64 @@ impl eframe::App for EurochefApp {
                     });
 
                 if !open {
-                    *state = AppState::Ready;
+                    self.state = AppState::Ready;
                 }
             }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if fileinfo.is_none() {
+            if self.fileinfo.is_none() {
                 ui.heading("No file loaded");
                 return;
             }
 
             ui.horizontal(|ui| {
-                if fileinfo.is_some() {
-                    ui.selectable_value(current_panel, Panel::FileInfo, "File info");
+                if self.fileinfo.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::FileInfo, "File info");
                 }
 
-                if spreadsheetlist.is_some() {
-                    ui.selectable_value(current_panel, Panel::Spreadsheets, "Text");
+                if self.spreadsheetlist.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::Spreadsheets, "Text");
                 }
 
-                if textures.is_some() {
-                    ui.selectable_value(current_panel, Panel::Textures, "Textures");
+                if self.textures.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::Textures, "Textures");
                 }
 
-                if entities.is_some() {
-                    ui.selectable_value(current_panel, Panel::Entities, "Entities");
+                if self.entities.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::Entities, "Entities");
                 }
 
-                if scripts.is_some() {
-                    ui.selectable_value(current_panel, Panel::Scripts, "Scripts");
+                if self.scripts.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::Scripts, "Scripts");
                 }
 
-                if maps.is_some() {
-                    ui.selectable_value(current_panel, Panel::Maps, "Maps");
+                if self.maps.is_some() {
+                    ui.selectable_value(&mut self.current_panel, Panel::Maps, "Maps");
                 }
             });
             ui.separator();
 
-            match current_panel {
-                Panel::FileInfo => fileinfo
+            match &mut self.current_panel {
+                Panel::FileInfo => self.fileinfo
                     .as_mut()
                     .map(|s| s.show(ui, &self.hashcodes, &self.render_store.read())),
-                Panel::Textures => textures.as_mut().map(|s| s.show(ui)),
-                Panel::Entities => entities.as_mut().map(|s| s.show(ctx, ui)),
-                Panel::Spreadsheets => spreadsheetlist.as_mut().map(|s| s.show(ui)),
+                Panel::Textures => self.textures.as_mut().map(|s| s.show(ui)),
+                Panel::Entities => self.entities.as_mut().map(|s| s.show(ctx, ui)),
+                Panel::Spreadsheets => self.spreadsheetlist.as_mut().map(|s| s.show(ui)),
                 Panel::Maps => {
-                    if let Some(Err(e)) = maps.as_mut().map(|s| s.show(ctx, ui)) {
+                    if let Some(Err(e)) = self.maps.as_mut().map(|s| s.show(ctx, ui)) {
                         self.state = AppState::Error(e);
                     };
                     Some(())
                 }
-                Panel::Scripts => scripts.as_mut().map(|s| s.show(ui)),
+                Panel::Scripts => self.scripts.as_mut().map(|s| s.show(ui)),
             };
         });
 
         // TODO(cohae): Should be implemented in `TextureList::show`
-        match current_panel {
-            Panel::Textures => textures.as_mut().map(|s| s.show_enlarged_window(ctx)),
+        match &mut self.current_panel {
+            Panel::Textures => self.textures.as_mut().map(|s| s.show_enlarged_window(ctx)),
             _ => None,
         };
     }

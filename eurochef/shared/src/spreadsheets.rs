@@ -30,6 +30,7 @@ pub struct UXGeoDataSheet {
 #[derive(Clone)]
 pub struct UXGeoTextSection {
     pub hashcode: u32,
+    pub index: usize,
     pub entries: Vec<UXGeoTextItem>,
 }
 
@@ -56,9 +57,10 @@ impl UXGeoSpreadsheet {
                         .read_type::<EXGeoSpreadSheet>(edb.endian)
                         .context("Failed to read spreadsheet")?;
 
-                    for s in sheader.sections {
+                    for (i, s) in sheader.sections.into_iter().enumerate() {
                         let mut section = UXGeoTextSection {
                             hashcode: s.hashcode,
+                            index: i,
                             entries: vec![],
                         };
                         let refpointer = &edb.header.refpointer_list[s.refpointer_index as usize];
