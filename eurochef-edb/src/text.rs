@@ -3,7 +3,7 @@ use binrw::{binrw, NullWideString};
 use crate::common::EXRelPtr;
 
 #[binrw]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EXGeoSpreadSheet {
     pub section_count: u32,
 
@@ -12,7 +12,7 @@ pub struct EXGeoSpreadSheet {
 }
 
 #[binrw]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EXGeoTextSection {
     pub hashcode: u32,
     pub refpointer_index: u32,
