@@ -9,6 +9,7 @@ pub fn execute_patch_text(
     filename: String,
     csv_file: String,
     output_filename: Option<String>,
+    target_set: Option<u32>,
 ) -> anyhow::Result<()> {
     let mut file_data = std::fs::read(&filename).context("Failed to read EDB file")?;
 
@@ -45,6 +46,7 @@ pub fn execute_patch_text(
         original_addr: u64,
         original_bytes: usize,
         final_text: String,
+        is_null: bool,
         was_patched: bool,
     }
 
@@ -56,12 +58,10 @@ pub fn execute_patch_text(
 
     let mut all_text_items: Vec<TextItemInfo> = vec![];
     let endian;
-    let version;
     {
         let reader = Cursor::new(file_data.clone());
         let mut edb = EdbFile::new(Box::new(reader), Platform::Pc)?;
         endian = edb.endian;
-        version = edb.header.version;
 
         let header = edb.header.clone();
         for s in &header.spreadsheet_list {
@@ -81,27 +81,52 @@ pub fn execute_patch_text(
                     let item_pos = edb.stream_position()?;
                     let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
 
-                    let current_text = item.string.to_string();
-                    let original_bytes = (current_text.encode_utf16().count() + 1) * 2;
+                    let is_null = item.string.offset_relative() == 0;
+                    let current_text = if is_null { String::new() } else { item.string.to_string() };
+                    let original_bytes = if is_null { 0 } else { (current_text.encode_utf16().count() + 1) * 2 };
                     
                     let mut was_patched = false;
-                    let final_text = match translations.get(&(s_idx, item.hashcode)) {
-                        Some(new_text) => {
-                            if current_text.trim() != new_text.as_str() {
-                                was_patched = true;
-                                new_text.clone()
-                            } else {
-                                current_text
+                    let final_text = if let Some(target_set) = target_set {
+                        if (s_section.hashcode & 0xffff0000) == target_set {
+                            match translations.get(&(s_idx, item.hashcode)) {
+                                Some(new_text) => {
+                                    if current_text.trim() != new_text.as_str() {
+                                        was_patched = true;
+                                        new_text.clone()
+                                    } else {
+                                        current_text
+                                    }
+                                },
+                                None => current_text,
                             }
-                        },
-                        None => current_text,
+                        } else {
+                            if !is_null {
+                                was_patched = true;
+                                String::new()
+                            } else {
+                                String::new()
+                            }
+                        }
+                    } else {
+                        match translations.get(&(s_idx, item.hashcode)) {
+                            Some(new_text) => {
+                                if current_text.trim() != new_text.as_str() {
+                                    was_patched = true;
+                                    new_text.clone()
+                                } else {
+                                    current_text
+                                }
+                            },
+                            None => current_text,
+                        }
                     };
 
                     all_text_items.push(TextItemInfo {
                         ptr_pos: item_pos + 4,
-                        original_addr: item.string.offset_absolute(),
+                        original_addr: if is_null { 0 } else { item.string.offset_absolute() },
                         original_bytes,
                         final_text,
+                        is_null,
                         was_patched,
                     });
                 }
@@ -109,10 +134,12 @@ pub fn execute_patch_text(
         }
     }
 
-    let mut regions: Vec<Region> = all_text_items.iter().map(|item| Region {
-        start: item.original_addr,
-        end: item.original_addr + item.original_bytes as u64,
-    }).collect();
+    let mut regions: Vec<Region> = all_text_items.iter()
+        .filter(|item| !item.is_null)
+        .map(|item| Region {
+            start: item.original_addr,
+            end: item.original_addr + item.original_bytes as u64,
+        }).collect();
 
     regions.sort_by_key(|r| r.start);
     let mut merged_regions: Vec<Region> = vec![];
@@ -128,14 +155,14 @@ pub fn execute_patch_text(
         merged_regions.push(r);
     }
 
-    let total_original_space: u64 = merged_regions.iter().map(|r| r.end - r.start).sum();
+    let mut final_merged_regions = merged_regions;
+
+    let total_original_space: u64 = final_merged_regions.iter().map(|r| r.end - r.start).sum();
     info!("Total available string space reclaimed: {} bytes", total_original_space);
 
     let mut string_pool = std::collections::HashMap::new();
-    let mut strings_patched = 0;
-    let mut strings_truncated = 0;
 
-    for region in &merged_regions {
+    for region in &final_merged_regions {
         let start = region.start as usize;
         let end = region.end as usize;
         if end <= file_data.len() {
@@ -148,8 +175,10 @@ pub fn execute_patch_text(
     let mut unique_strings: Vec<String> = vec![];
     let mut seen = std::collections::HashSet::new();
     for item in &all_text_items {
-        if seen.insert(item.final_text.clone()) {
-            unique_strings.push(item.final_text.clone());
+        if !item.is_null {
+            if seen.insert(item.final_text.clone()) {
+                unique_strings.push(item.final_text.clone());
+            }
         }
     }
 
@@ -161,7 +190,7 @@ pub fn execute_patch_text(
         }
         
         let mut allocated = None;
-        for region in &mut merged_regions {
+        for region in &mut final_merged_regions {
             let start_aligned = (region.start + 3) & !3;
             if region.end >= start_aligned + needed_bytes as u64 {
                 allocated = Some(start_aligned);
@@ -214,7 +243,6 @@ pub fn execute_patch_text(
             }
             
             file_data.extend_from_slice(&utf16_bytes);
-            strings_patched += 1;
         }
     }
 
@@ -224,16 +252,19 @@ pub fn execute_patch_text(
         Endian::Big => new_size.to_be_bytes(),
     };
     file_data[20..24].copy_from_slice(&size_bytes);
+    file_data[24..28].copy_from_slice(&size_bytes); // Also update base_file_size
 
     for item in &all_text_items {
-        if let Some(&addr) = string_pool.get(&item.final_text) {
-            let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
-            let offset_bytes = match endian {
-                Endian::Little => relative_offset.to_le_bytes(),
-                Endian::Big => relative_offset.to_be_bytes(),
-            };
-            let ptr_start = item.ptr_pos as usize;
-            file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
+        if !item.is_null {
+            if let Some(&addr) = string_pool.get(&item.final_text) {
+                let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
+                let offset_bytes = match endian {
+                    Endian::Little => relative_offset.to_le_bytes(),
+                    Endian::Big => relative_offset.to_be_bytes(),
+                };
+                let ptr_start = item.ptr_pos as usize;
+                file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
+            }
         }
     }
 

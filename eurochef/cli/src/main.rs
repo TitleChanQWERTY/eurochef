@@ -151,6 +151,10 @@ enum EdbCommand {
 
         /// Output .edb file (optional, will overwrite if not specified)
         output_filename: Option<String>,
+
+        /// Target Set ID to patch (e.g. 08010000). All other sets will be wiped.
+        #[arg(long, short, value_parser = maybe_hex::<u32>)]
+        set: Option<u32>,
     },
 }
 
@@ -258,7 +262,8 @@ fn handle_edb(cmd: EdbCommand) -> anyhow::Result<()> {
             filename,
             csv_file,
             output_filename,
-        } => edb::patch::execute_patch_text(filename, csv_file, output_filename),
+            set,
+        } => edb::patch::execute_patch_text(filename, csv_file, output_filename, set),
     }
 }
 

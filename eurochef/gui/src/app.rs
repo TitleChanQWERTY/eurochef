@@ -78,6 +78,7 @@ pub struct EurochefApp {
     game: String,
     pub current_file: Option<String>,
     pub current_platform: Option<Platform>,
+    pub selected_set: Option<u32>,
     console_logs: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     show_console: bool,
 }
@@ -147,6 +148,7 @@ impl EurochefApp {
             show_profiler: false,
             current_file: None,
             current_platform: None,
+            selected_set: None,
             console_logs,
             show_console: false,
         };
@@ -476,6 +478,7 @@ impl EurochefApp {
             original_addr: u64,
             original_bytes: usize,
             final_text: String,
+            is_null: bool,
             was_patched: bool,
         }
 
@@ -517,21 +520,45 @@ impl EurochefApp {
                         let item_pos = edb.stream_position()?;
                         let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
 
-                        let current_text = item.string.to_string();
-                        let original_bytes = (current_text.encode_utf16().count() + 1) * 2;
+                        let is_null = item.string.offset_relative() == 0;
+                        let current_text = if is_null { String::new() } else { item.string.to_string() };
+                        let original_bytes = if is_null { 0 } else { (current_text.encode_utf16().count() + 1) * 2 };
                         
                         let mut was_patched = false;
                         let final_text = if is_target_spreadsheet {
-                            match translations.get(&(i, item.hashcode)) {
-                                Some(new_text) => {
-                                    if current_text.trim() != new_text.as_str() {
-                                        was_patched = true;
-                                        new_text.clone()
-                                    } else {
-                                        current_text
+                            if let Some(target_set) = self.selected_set {
+                                if (s_section.hashcode & 0xffff0000) == target_set {
+                                    match translations.get(&(i, item.hashcode)) {
+                                        Some(new_text) => {
+                                            if current_text.trim() != new_text.as_str() {
+                                                was_patched = true;
+                                                new_text.clone()
+                                            } else {
+                                                current_text
+                                            }
+                                        },
+                                        None => current_text,
                                     }
-                                },
-                                None => current_text,
+                                } else {
+                                    if !is_null {
+                                        was_patched = true;
+                                        String::new()
+                                    } else {
+                                        String::new()
+                                    }
+                                }
+                            } else {
+                                match translations.get(&(i, item.hashcode)) {
+                                    Some(new_text) => {
+                                        if current_text.trim() != new_text.as_str() {
+                                            was_patched = true;
+                                            new_text.clone()
+                                        } else {
+                                            current_text
+                                        }
+                                    },
+                                    None => current_text,
+                                }
                             }
                         } else {
                             current_text
@@ -539,9 +566,10 @@ impl EurochefApp {
 
                         all_text_items.push(TextItemInfo {
                             ptr_pos: item_pos + 4,
-                            original_addr: item.string.offset_absolute(),
+                            original_addr: if is_null { 0 } else { item.string.offset_absolute() },
                             original_bytes,
                             final_text,
+                            is_null,
                             was_patched,
                         });
                     }
@@ -549,10 +577,12 @@ impl EurochefApp {
             }
         }
 
-        let mut regions: Vec<Region> = all_text_items.iter().map(|item| Region {
-            start: item.original_addr,
-            end: item.original_addr + item.original_bytes as u64,
-        }).collect();
+        let mut regions: Vec<Region> = all_text_items.iter()
+            .filter(|item| !item.is_null)
+            .map(|item| Region {
+                start: item.original_addr,
+                end: item.original_addr + item.original_bytes as u64,
+            }).collect();
 
         regions.sort_by_key(|r| r.start);
         let mut merged_regions: Vec<Region> = vec![];
@@ -568,11 +598,13 @@ impl EurochefApp {
             merged_regions.push(r);
         }
 
+        let mut final_merged_regions = merged_regions;
+
         let mut string_pool = std::collections::HashMap::new();
         let mut strings_patched = 0;
         let mut strings_truncated = 0;
 
-        for region in &merged_regions {
+        for region in &final_merged_regions {
             let start = region.start as usize;
             let end = region.end as usize;
             if end <= file_data.len() {
@@ -585,8 +617,10 @@ impl EurochefApp {
         let mut unique_strings: Vec<String> = vec![];
         let mut seen = std::collections::HashSet::new();
         for item in &all_text_items {
-            if seen.insert(item.final_text.clone()) {
-                unique_strings.push(item.final_text.clone());
+            if !item.is_null {
+                if seen.insert(item.final_text.clone()) {
+                    unique_strings.push(item.final_text.clone());
+                }
             }
         }
 
@@ -598,7 +632,7 @@ impl EurochefApp {
             }
             
             let mut allocated = None;
-            for region in &mut merged_regions {
+            for region in &mut final_merged_regions {
                 let start_aligned = (region.start + 3) & !3;
                 if region.end >= start_aligned + needed_bytes as u64 {
                     allocated = Some(start_aligned);
@@ -661,16 +695,19 @@ impl EurochefApp {
             Endian::Big => new_size.to_be_bytes(),
         };
         file_data[20..24].copy_from_slice(&size_bytes);
+        file_data[24..28].copy_from_slice(&size_bytes); // Update base_file_size
 
         for item in &all_text_items {
-            if let Some(&addr) = string_pool.get(&item.final_text) {
-                let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
-                let offset_bytes = match endian {
-                    Endian::Little => relative_offset.to_le_bytes(),
-                    Endian::Big => relative_offset.to_be_bytes(),
-                };
-                let ptr_start = item.ptr_pos as usize;
-                file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
+            if !item.is_null {
+                if let Some(&addr) = string_pool.get(&item.final_text) {
+                    let relative_offset = (addr as i64 - item.ptr_pos as i64) as i32;
+                    let offset_bytes = match endian {
+                        Endian::Little => relative_offset.to_le_bytes(),
+                        Endian::Big => relative_offset.to_be_bytes(),
+                    };
+                    let ptr_start = item.ptr_pos as usize;
+                    file_data[ptr_start..ptr_start + 4].copy_from_slice(&offset_bytes);
+                }
             }
         }
 
@@ -1044,6 +1081,37 @@ impl eframe::App for EurochefApp {
 
                 if self.spreadsheetlist.is_some() {
                     ui.selectable_value(&mut self.current_panel, Panel::Spreadsheets, "Text");
+
+                    if self.current_panel == Panel::Spreadsheets {
+                        ui.separator();
+                        ui.label("Patch language: ");
+                        let spreadsheet_list = self.spreadsheetlist.as_ref().unwrap();
+                        let spreadsheet = spreadsheet_list.spreadsheets.iter().find(|(_, v)| match v {
+                            UXGeoSpreadsheet::Data(_) => false,
+                            UXGeoSpreadsheet::Text(_) => true,
+                        });
+
+                        if let Some((_, UXGeoSpreadsheet::Text(sections))) = spreadsheet {
+                            let mut selected_text = if let Some(set) = self.selected_set {
+                                format!("Set {:08x}", set)
+                            } else {
+                                "All languages".to_string()
+                            };
+
+                            let mut sets: Vec<u32> = sections.iter().map(|s| s.hashcode & 0xffff0000).collect();
+                            sets.sort();
+                            sets.dedup();
+
+                            egui::ComboBox::from_id_source("language_selector")
+                                .selected_text(selected_text)
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(&mut self.selected_set, None, "All languages");
+                                    for set in sets {
+                                        ui.selectable_value(&mut self.selected_set, Some(set), format!("Set {:08x}", set));
+                                    }
+                                });
+                        }
+                    }
                 }
 
                 if self.textures.is_some() {
