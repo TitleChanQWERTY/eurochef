@@ -8,6 +8,7 @@ pub mod platform;
 pub mod script;
 pub mod spreadsheets;
 pub mod textures;
+pub mod edb_patcher;
 
 pub struct IdentifiableResult<T: Clone> {
     pub hashcode: u32,
