@@ -580,6 +580,12 @@ impl eframe::App for EurochefApp {
             }
         });
 
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+            if let Err(e) = self.save_spreadsheets() {
+                self.state = AppState::Error(e);
+            }
+        }
+
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
@@ -620,7 +626,7 @@ impl eframe::App for EurochefApp {
                     }
 
                     if let Some(current_file) = &self.current_file {
-                        if ui.button(format!("Save {}", Path::new(current_file).file_name().unwrap().to_string_lossy())).clicked() {
+                        if ui.button(format!("Save {} (Ctrl+S)", Path::new(current_file).file_name().unwrap().to_string_lossy())).clicked() {
                             if let Err(e) = self.save_spreadsheets() {
                                 self.state = AppState::Error(e);
                             }

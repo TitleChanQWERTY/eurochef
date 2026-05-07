@@ -14,6 +14,10 @@ pub struct TextItemList {
     filtered_indices: Option<Vec<Vec<usize>>>,
     last_edited_item: Option<(usize, usize)>,
     should_scroll: bool,
+    modified_items: std::collections::HashSet<(usize, usize)>,
+    search_only_modified: bool,
+    search_section: String,
+    reference_text: std::collections::HashMap<u32, String>,
 }
 
 impl TextItemList {
@@ -26,6 +30,10 @@ impl TextItemList {
             filtered_indices: None,
             last_edited_item: None,
             should_scroll: false,
+            modified_items: std::collections::HashSet::new(),
+            search_only_modified: false,
+            search_section: String::new(),
+            reference_text: std::collections::HashMap::new(),
         }
     }
 
@@ -50,40 +58,59 @@ impl TextItemList {
                 .changed()
             {
                 update_filter = true;
-                if self.search_text.is_empty() && self.search_hashcode.is_empty() {
-                    self.should_scroll = true;
-                }
             }
+
+            ui.label("Section: ");
+            if egui::TextEdit::singleline(&mut self.search_section)
+                .font(FontSelection::Style(egui::TextStyle::Monospace))
+                .desired_width(76.0)
+                .show(ui)
+                .response
+                .changed()
+            {
+                update_filter = true;
+            }
+
+            if ui.checkbox(&mut self.search_only_modified, "Modified only").changed() {
+                update_filter = true;
+            }
+
             if ui.button("X").clicked() {
                 self.search_text.clear();
                 self.search_hashcode.clear();
+                self.search_section.clear();
+                self.search_only_modified = false;
                 update_filter = true;
                 self.should_scroll = true;
             }
             ui.separator();
             if ui.button("Export CSV").clicked() {
-                let this = self.clone();
-                std::thread::spawn(move || {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("CSV", &["csv"])
-                        .save_file()
-                    {
-                        this.export_csv(path);
-                    }
-                });
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .save_file()
+                {
+                    self.export_csv(path);
+                }
             }
             if ui.button("Import CSV").clicked() {
-                // For import we might need a channel or state update, but for now 
-                // let's at least prevent the crash. Note: UI won't update immediately.
-                let mut this = self.clone();
-                std::thread::spawn(move || {
-                    if let Some(path) = rfd::FileDialog::new()
-                        .add_filter("CSV", &["csv"])
-                        .pick_file()
-                    {
-                        this.import_csv(path);
-                    }
-                });
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .pick_file()
+                {
+                    self.import_csv(path);
+                    update_filter = true;
+                }
+            }
+            if ui.button("Load Reference EDB").clicked() {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("EngineX Database", &["edb"])
+                    .pick_file()
+                {
+                    // Guess platform from current file or just use PC/PS2 as common ones
+                    // For now, let's just try to read it with a few common platforms or the current one
+                    // Actually, let's just use a simple guesser or ask? No, let's just use a helper.
+                    self.load_reference(path);
+                }
             }
         });
 
@@ -110,10 +137,22 @@ impl TextItemList {
             self.filtered_indices = Some(
                 sections
                     .iter()
-                    .map(|s| {
+                    .enumerate()
+                    .map(|(si, s)| {
+                        if !self.search_section.is_empty() && !format!("{:08x}", s.hashcode).contains(&self.search_section.to_lowercase()) {
+                            return vec![];
+                        }
+
                         s.entries
                             .iter()
                             .enumerate()
+                            .filter(|(i, v)| {
+                                if self.search_only_modified {
+                                    self.modified_items.contains(&(si, *i))
+                                } else {
+                                    true
+                                }
+                            })
                             .filter(|(_, v)| {
                                 if self.search_hashcode.is_empty() {
                                     true
@@ -174,8 +213,13 @@ impl TextItemList {
                     let mut table = egui_extras::TableBuilder::new(ui)
                         .striped(true)
                         .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
-                        .column(egui_extras::Column::initial(90.0).resizable(true).clip(true))
-                        .column(egui_extras::Column::remainder().at_least(300.0).resizable(true).clip(true));
+                        .column(egui_extras::Column::initial(90.0).resizable(true).clip(true));
+                    
+                    if !self.reference_text.is_empty() {
+                        table = table.column(egui_extras::Column::initial(300.0).resizable(true).clip(true));
+                    }
+
+                    table = table.column(egui_extras::Column::remainder().at_least(300.0).resizable(true).clip(true));
 
                     if self.should_scroll {
                         if let Some((section_idx, item_idx)) = self.last_edited_item {
@@ -193,6 +237,11 @@ impl TextItemList {
                         header.col(|ui| {
                             ui.strong("Sound");
                         });
+                        if !self.reference_text.is_empty() {
+                            header.col(|ui| {
+                                ui.strong("Reference");
+                            });
+                        }
                         header.col(|ui| {
                             ui.strong("Text");
                         });
@@ -233,11 +282,28 @@ impl TextItemList {
                             .1
                             .context_menu(context_menu.clone());
 
+                            if !self.reference_text.is_empty() {
+                                row.col(|ui| {
+                                    let ref_text = self.reference_text.get(&item.hashcode).cloned().unwrap_or_default();
+                                    ui.label(egui::RichText::new(ref_text).italics().color(egui::Color32::GRAY));
+                                });
+                            }
+
                             row.col(|ui| {
-                                let text_edit = egui::TextEdit::singleline(&mut item.text)
-                                    .desired_width(f32::INFINITY);
+                                let is_modified = self.modified_items.contains(&(current_section, item_index));
+                                let mut text_color = None;
+                                if is_modified {
+                                    text_color = Some(egui::Color32::from_rgb(255, 255, 100));
+                                }
+
+                                let text_edit = egui::TextEdit::multiline(&mut item.text)
+                                    .desired_width(f32::INFINITY)
+                                    .desired_rows(1)
+                                    .text_color_opt(text_color);
+
                                 if ui.add(text_edit).changed() {
                                     edited_item = Some((current_section, item_index));
+                                    self.modified_items.insert((current_section, item_index));
                                 }
                             })
                             .1
@@ -264,7 +330,7 @@ impl TextItemList {
                 writeln!(w, "Section,Hashcode,Sound,Text").ok();
                 for (section_idx, section) in sections.iter().enumerate() {
                     for item in &section.entries {
-                        let escaped_text = item.text.replace('"', "\"\"");
+                        let escaped_text = item.text.replace('"', "\"\"").replace('\n', "\\n");
                         writeln!(w, "{},{:08x},{:08x},\"{}\"", section_idx, item.hashcode, item.sound_hashcode, escaped_text).ok();
                     }
                 }
@@ -289,11 +355,12 @@ impl TextItemList {
                     if let (Some(section_idx), Some(hashcode_str), Some(_sound), Some(text_part)) = (parts.next(), parts.next(), parts.next(), parts.next()) {
                         if let Ok(section_idx) = section_idx.parse::<usize>() {
                             if let Ok(hashcode) = u32::from_str_radix(hashcode_str, 16) {
-                                let unescaped = text_part.trim_matches('"').replace("\"\"", "\"");
+                                let unescaped = text_part.trim_matches('"').replace("\"\"", "\"").replace("\\n", "\n");
                                 if let Some(section) = sections.get_mut(section_idx) {
-                                    if let Some(item) = section.entries.iter_mut().find(|e| e.hashcode == hashcode) {
+                                    if let Some((i, item)) = section.entries.iter_mut().enumerate().find(|(_, e)| e.hashcode == hashcode) {
                                         if item.text != unescaped {
                                             item.text = unescaped;
+                                            self.modified_items.insert((section_idx, i));
                                             imported += 1;
                                         }
                                     }
@@ -303,6 +370,31 @@ impl TextItemList {
                     }
                 }
                 tracing::info!("Imported {} updated texts from CSV", imported);
+            }
+        }
+    }
+
+    pub fn load_reference(&mut self, path: std::path::PathBuf) {
+        use eurochef_edb::edb::EdbFile;
+        use eurochef_edb::versions::Platform;
+        use std::io::BufReader;
+
+        let platform = Platform::from_path(&path).unwrap_or(Platform::Pc);
+        if let Ok(f) = std::fs::File::open(path) {
+            let reader = BufReader::new(f);
+            if let Ok(mut edb) = EdbFile::new(Box::new(reader), platform) {
+                if let Ok(spreadsheets) = UXGeoSpreadsheet::read_all(&mut edb) {
+                    self.reference_text.clear();
+                    for (_, s) in spreadsheets {
+                        if let UXGeoSpreadsheet::Text(sections) = s {
+                            for section in sections {
+                                for entry in section.entries {
+                                    self.reference_text.insert(entry.hashcode, entry.text);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
