@@ -1,189 +1,85 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom};
 use eurochef_edb::binrw::{BinReaderExt, Endian};
 use eurochef_edb::edb::EdbFile;
 use eurochef_edb::text::{EXGeoSpreadSheet, EXGeoTextItem};
-
-pub struct TextItemRecord {
-    pub ptr_pos: u64,
-    pub original_addr: u64,
-    pub final_text: String,
-    pub is_null: bool,
-}
 
 pub fn patch_text_in_edb(
     file_data: &mut Vec<u8>,
     edb: &mut EdbFile,
     translations: &HashMap<(usize, u32), String>,
     target_set: Option<u32>,
-    spreadsheet_hash: Option<u32>,
+    _spreadsheet_hash: Option<u32>,
 ) -> anyhow::Result<usize> {
     let endian = edb.endian;
-    let mut all_items = vec![];
+    let mut patched_count = 0;
 
     let spreadsheet_list = edb.header.spreadsheet_list.clone();
     let refpointer_list = edb.header.refpointer_list.clone();
 
     for s in &spreadsheet_list {
-        if s.stype != 1 {
-            continue;
-        }
-
-        if let Some(hash) = spreadsheet_hash {
-            if s.common.hashcode != hash {
-                continue;
-            }
-        }
+        if s.stype != 1 { continue; }
 
         edb.seek(SeekFrom::Start(s.common.address as u64))?;
         let sheader = edb.read_type::<EXGeoSpreadSheet>(edb.endian)?;
 
-        let sections = sheader.sections.clone();
-        for (s_section_idx, s_section) in sections.iter().enumerate() {
+        for (s_section_idx, s_section) in sheader.sections.iter().enumerate() {
+            let should_patch_set = if let Some(ts) = target_set {
+                (s_section.hashcode & 0xffff0000) == ts
+            } else {
+                true
+            };
+
+            if !should_patch_set { continue; }
+
             let refpointer = &refpointer_list[s_section.refpointer_index as usize];
             edb.seek(SeekFrom::Start(refpointer.address as u64 + 4))?;
             let text_count = edb.read_type::<u32>(edb.endian)?;
 
             for _ in 0..text_count {
-                let item_pos = edb.stream_position()?;
                 let item = edb.read_type::<EXGeoTextItem>(edb.endian)?;
 
-                let is_null = item.string.offset_relative() == 0;
-                let current_text = if is_null { String::new() } else { item.string.to_string() };
-                
-                let mut final_text = current_text.clone();
-                let should_patch = if let Some(ts) = target_set {
-                    (s_section.hashcode & 0xffff0000) == ts
-                } else {
-                    true
-                };
+                if let Some(new_text) = translations.get(&(s_section_idx, item.hashcode)) {
+                    let is_null = item.string.offset_relative() == 0;
+                    if is_null { continue; }
 
-                if should_patch {
-                    if let Some(new_text) = translations.get(&(s_section_idx, item.hashcode)) {
-                        final_text = new_text.clone();
+                    let original_addr = item.string.offset_absolute() as usize;
+                    let original_text = item.string.to_string();
+                    
+                    // Available space in bytes (including null terminator)
+                    let available_space = (original_text.encode_utf16().count() + 1) * 2;
+
+                    // Prepare new UTF-16 bytes
+                    let mut utf16_bytes = vec![];
+                    for wchar in new_text.encode_utf16() {
+                        match endian {
+                            Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
+                            Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+                        }
                     }
-                }
-
-                all_items.push(TextItemRecord {
-                    ptr_pos: item_pos + 4,
-                    original_addr: if is_null { 0 } else { item.string.offset_absolute() },
-                    final_text,
-                    is_null,
-                });
-            }
-        }
-    }
-
-    let mut string_info: BTreeMap<u64, (String, Vec<u64>)> = BTreeMap::new();
-    for item in &all_items {
-        if item.is_null { continue; }
-        let entry = string_info.entry(item.original_addr).or_insert_with(|| (item.final_text.clone(), vec![]));
-        entry.1.push(item.ptr_pos);
-    }
-
-    let mut regions = vec![];
-    let addrs: Vec<u64> = string_info.keys().cloned().collect();
-    for &addr in &addrs {
-        let (text, _) = &string_info[&addr];
-        let size = (text.encode_utf16().count() + 1) * 2;
-        regions.push((addr, addr + size as u64));
-    }
-    regions.sort_by_key(|r| r.0);
-
-    let mut merged: Vec<(u64, u64)> = vec![];
-    for r in regions {
-        if let Some(last) = merged.last_mut() {
-            if r.0 <= last.1 {
-                if r.1 > last.1 { last.1 = r.1; }
-                continue;
-            }
-        }
-        merged.push(r);
-    }
-
-    let mut final_string_map = HashMap::new();
-    let mut relocated_strings = vec![];
-
-    for (r_start, r_end) in merged {
-        let mut strings_in_region: Vec<u64> = addrs.iter().cloned().filter(|&a| a >= r_start && a < r_end).collect();
-        strings_in_region.sort();
-        strings_in_region.dedup();
-
-        for i in 0..strings_in_region.len() {
-            let addr = strings_in_region[i];
-            let next_addr = if i + 1 < strings_in_region.len() { strings_in_region[i+1] } else { r_end };
-            let available = (next_addr - addr) as usize;
-            
-            let (new_text, _) = &string_info[&addr];
-            let needed = (new_text.encode_utf16().count() + 1) * 2;
-
-            if needed <= available {
-                final_string_map.insert(addr, addr);
-                let start = addr as usize;
-                let mut utf16_bytes = vec![];
-                for wchar in new_text.encode_utf16() {
+                    // Add null terminator
                     match endian {
-                        Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
-                        Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
+                        Endian::Little => utf16_bytes.extend_from_slice(&0u16.to_le_bytes()),
+                        Endian::Big => utf16_bytes.extend_from_slice(&0u16.to_be_bytes()),
                     }
+
+                    // TRUNCATE if it doesn't fit
+                    let write_len = utf16_bytes.len().min(available_space);
+                    
+                    // Write directly into the original file data
+                    file_data[original_addr..original_addr + write_len].copy_from_slice(&utf16_bytes[..write_len]);
+                    
+                    // Ensure the last two bytes of available space are null if we truncated or reached exactly the end
+                    if write_len >= available_space {
+                        file_data[original_addr + available_space - 2] = 0;
+                        file_data[original_addr + available_space - 1] = 0;
+                    }
+
+                    patched_count += 1;
                 }
-                utf16_bytes.push(0);
-                utf16_bytes.push(0);
-                file_data[start..start + utf16_bytes.len()].copy_from_slice(&utf16_bytes);
-                for b in &mut file_data[start + utf16_bytes.len()..next_addr as usize] {
-                    *b = 0;
-                }
-            } else {
-                relocated_strings.push(addr);
             }
         }
     }
 
-    for addr in relocated_strings {
-        let (new_text, _) = &string_info[&addr];
-        let mut needed = (new_text.encode_utf16().count() + 1) * 2;
-        if needed % 4 != 0 { needed += 2; }
-
-        let alloc_addr = (file_data.len() as u64 + 3) & !3;
-        let padding = (alloc_addr as usize).saturating_sub(file_data.len());
-        file_data.extend(std::iter::repeat(0).take(padding));
-        
-        final_string_map.insert(addr, alloc_addr);
-        
-        let mut utf16_bytes = vec![];
-        for wchar in new_text.encode_utf16() {
-            match endian {
-                Endian::Little => utf16_bytes.extend_from_slice(&wchar.to_le_bytes()),
-                Endian::Big => utf16_bytes.extend_from_slice(&wchar.to_be_bytes()),
-            }
-        }
-        utf16_bytes.push(0);
-        utf16_bytes.push(0);
-        while utf16_bytes.len() < needed { utf16_bytes.push(0); }
-        file_data.extend_from_slice(&utf16_bytes);
-    }
-
-    let new_size = file_data.len() as u32;
-    let sz_bytes = match endian {
-        Endian::Little => new_size.to_le_bytes(),
-        Endian::Big => new_size.to_be_bytes(),
-    };
-    file_data[20..24].copy_from_slice(&sz_bytes);
-    file_data[24..28].copy_from_slice(&sz_bytes);
-
-    for (orig_addr, (_, ptr_positions)) in &string_info {
-        if let Some(&final_addr) = final_string_map.get(&orig_addr) {
-            for &ptr_pos in ptr_positions {
-                let rel = (final_addr as i64 - ptr_pos as i64) as i32;
-                let rel_bytes = match endian {
-                    Endian::Little => rel.to_le_bytes(),
-                    Endian::Big => rel.to_be_bytes(),
-                };
-                let p = ptr_pos as usize;
-                file_data[p..p+4].copy_from_slice(&rel_bytes);
-            }
-        }
-    }
-
-    Ok(string_info.len())
+    Ok(patched_count)
 }

@@ -626,6 +626,22 @@ impl eframe::App for EurochefApp {
                             }
                             ui.close_menu();
                         }
+
+                        if self.spreadsheetlist.is_some() {
+                            if ui.button("Export Hook CSV (translations.csv)").clicked() {
+                                let spreadsheetlist = self.spreadsheetlist.as_ref().unwrap().clone();
+                                std::thread::spawn(move || {
+                                    if let Some(path) = rfd::FileDialog::new()
+                                        .set_file_name("translations.csv")
+                                        .add_filter("CSV", &["csv"])
+                                        .save_file() 
+                                    {
+                                        spreadsheetlist.export_csv(path);
+                                    }
+                                });
+                                ui.close_menu();
+                            }
+                        }
                     }
                 });
 

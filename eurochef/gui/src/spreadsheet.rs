@@ -2,6 +2,7 @@ use egui::FontSelection;
 use eurochef_edb::Hashcode;
 use eurochef_shared::spreadsheets::{UXGeoSpreadsheet, UXGeoTextItem};
 
+#[derive(Clone)]
 pub struct TextItemList {
     /// Search query for a specific hashcode
     search_hashcode: String,
@@ -61,20 +62,28 @@ impl TextItemList {
             }
             ui.separator();
             if ui.button("Export CSV").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CSV", &["csv"])
-                    .save_file()
-                {
-                    self.export_csv(path);
-                }
+                let this = self.clone();
+                std::thread::spawn(move || {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .save_file()
+                    {
+                        this.export_csv(path);
+                    }
+                });
             }
             if ui.button("Import CSV").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("CSV", &["csv"])
-                    .pick_file()
-                {
-                    self.import_csv(path);
-                }
+                // For import we might need a channel or state update, but for now 
+                // let's at least prevent the crash. Note: UI won't update immediately.
+                let mut this = self.clone();
+                std::thread::spawn(move || {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("CSV", &["csv"])
+                        .pick_file()
+                    {
+                        this.import_csv(path);
+                    }
+                });
             }
         });
 
@@ -244,7 +253,7 @@ impl TextItemList {
         });
     }
 
-    fn export_csv(&self, path: std::path::PathBuf) {
+    pub fn export_csv(&self, path: std::path::PathBuf) {
         let spreadsheet = self.spreadsheets.iter().find(|(_, v)| match v {
             UXGeoSpreadsheet::Data(_) => false,
             UXGeoSpreadsheet::Text(_) => true,
@@ -264,7 +273,7 @@ impl TextItemList {
         }
     }
 
-    fn import_csv(&mut self, path: std::path::PathBuf) {
+    pub fn import_csv(&mut self, path: std::path::PathBuf) {
         let spreadsheet = self.spreadsheets.iter_mut().find(|(_, v)| match v {
             UXGeoSpreadsheet::Data(_) => false,
             UXGeoSpreadsheet::Text(_) => true,
