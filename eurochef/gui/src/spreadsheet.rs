@@ -112,6 +112,15 @@ impl TextItemList {
                     self.load_reference(path);
                 }
             }
+            ui.separator();
+            if ui.button("UA -> Victim").clicked() {
+                self.convert_to_victim();
+                update_filter = true;
+            }
+            if ui.button("Victim -> UA").clicked() {
+                self.convert_from_victim();
+                update_filter = true;
+            }
         });
 
         ui.separator();
@@ -393,6 +402,58 @@ impl TextItemList {
                                 }
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn convert_to_victim(&mut self) {
+        let spreadsheet = self.spreadsheets.iter_mut().find(|(_, v)| match v {
+            UXGeoSpreadsheet::Data(_) => false,
+            UXGeoSpreadsheet::Text(_) => true,
+        });
+        if let Some((_, UXGeoSpreadsheet::Text(sections))) = spreadsheet {
+            for (si, section) in sections.iter_mut().enumerate() {
+                for (ii, item) in section.entries.iter_mut().enumerate() {
+                    let mut new_text = item.text.clone();
+                    new_text = new_text.replace('є', "ъ");
+                    new_text = new_text.replace('Є', "Ъ");
+                    new_text = new_text.replace('ї', "э");
+                    new_text = new_text.replace('Ї', "Э");
+                    new_text = new_text.replace('і', "i");
+                    new_text = new_text.replace('І', "I");
+                    new_text = new_text.replace('ґ', "ы");
+                    new_text = new_text.replace('Ґ', "Ы");
+                    if new_text != item.text {
+                        item.text = new_text;
+                        self.modified_items.insert((si, ii));
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn convert_from_victim(&mut self) {
+        let spreadsheet = self.spreadsheets.iter_mut().find(|(_, v)| match v {
+            UXGeoSpreadsheet::Data(_) => false,
+            UXGeoSpreadsheet::Text(_) => true,
+        });
+        if let Some((_, UXGeoSpreadsheet::Text(sections))) = spreadsheet {
+            for (si, section) in sections.iter_mut().enumerate() {
+                for (ii, item) in section.entries.iter_mut().enumerate() {
+                    let mut new_text = item.text.clone();
+                    new_text = new_text.replace('ъ', "є");
+                    new_text = new_text.replace('Ъ', "Є");
+                    new_text = new_text.replace('э', "ї");
+                    new_text = new_text.replace('Э', "Ї");
+                    new_text = new_text.replace('i', "і");
+                    new_text = new_text.replace('I', "І");
+                    new_text = new_text.replace('ы', "ґ");
+                    new_text = new_text.replace('Ы', "Ґ");
+                    if new_text != item.text {
+                        item.text = new_text;
+                        self.modified_items.insert((si, ii));
                     }
                 }
             }
